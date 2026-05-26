@@ -1,4 +1,4 @@
-import type { Config, CredConfig, InstanceRecord } from './types';
+import type { Config, CredConfig, InstanceEvent, InstanceRecord } from './types';
 
 const STORAGE_KEY = 'sparkle_cred_config';
 
@@ -44,6 +44,9 @@ export const listInstances = (region: string): Promise<InstanceRecord[]> =>
 
 export const listRegions = (): Promise<string[]> =>
 	apiFetch<string[]>('/api/regions');
+
+export const listEvents = (region: string): Promise<InstanceEvent[]> =>
+	apiFetch<InstanceEvent[]>(`/api/events?region=${encodeURIComponent(region)}`);
 
 export const getConfig = (): Promise<Config> =>
 	apiFetch<Config>('/api/config');

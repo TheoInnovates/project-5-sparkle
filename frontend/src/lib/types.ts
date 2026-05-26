@@ -1,3 +1,11 @@
+export interface InstanceEvent {
+	event_time: string;
+	event_name: string;
+	instance_id: string;
+	username: string | null;
+	source_ip: string | null;
+}
+
 export interface InstanceRecord {
 	instance_id: string;
 	name: string;
@@ -13,6 +21,7 @@ export type CredSource = 'local' | 'env' | 'manual';
 
 export interface CredConfig {
 	source: CredSource;
+	region?: string;
 	accessKeyId?: string;
 	secretAccessKey?: string;
 	sessionToken?: string;

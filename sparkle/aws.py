@@ -13,6 +13,7 @@ import botocore.exceptions
 CACHE_TTL = 300  # seconds
 # Cache key: (region, access_key_id_or_empty)
 _cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+_events_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 _executor = ThreadPoolExecutor(max_workers=20)
 
 # CloudTrail rate limit: 2 req/s per account region
@@ -24,6 +25,15 @@ class Credentials:
     access_key_id: str
     secret_access_key: str
     session_token: str | None = None
+
+
+@dataclass
+class InstanceEvent:
+    event_time: str
+    event_name: str
+    instance_id: str
+    username: str | None
+    source_ip: str | None
 
 
 @dataclass
@@ -194,6 +204,112 @@ async def list_instances(region: str, creds: Credentials | None = None) -> list[
     records.sort(key=lambda r: r.name.lower())
     _cache[cache_key] = (now, [r.__dict__ for r in records])
     return records
+
+
+def _parse_instance_events(raw_events: list[dict]) -> list[InstanceEvent]:
+    import json as _json
+
+    result: list[InstanceEvent] = []
+    for event in raw_events:
+        raw_json = event.get("CloudTrailEvent", "{}")
+        try:
+            ct = _json.loads(raw_json)
+        except Exception:  # nosec B110
+            continue
+
+        event_name = ct.get("eventName", event.get("EventName", ""))
+
+        event_time_raw = ct.get("eventTime") or event.get("EventTime")
+        if isinstance(event_time_raw, datetime):
+            if event_time_raw.tzinfo is None:
+                event_time_raw = event_time_raw.replace(tzinfo=timezone.utc)
+            event_time_str = event_time_raw.isoformat()
+        else:
+            event_time_str = str(event_time_raw) if event_time_raw else ""
+
+        identity = ct.get("userIdentity", {})
+        username: str | None = (
+            identity.get("userName") or identity.get("arn") or identity.get("type")
+        )
+        source_ip: str | None = ct.get("sourceIPAddress")
+
+        # RunInstances: IDs are in responseElements (instance didn't exist at request time)
+        # Start/Stop/Terminate: IDs are in requestParameters
+        if event_name == "RunInstances":
+            items = ((ct.get("responseElements") or {})
+                     .get("instancesSet", {})
+                     .get("items", []))
+        else:
+            items = ((ct.get("requestParameters") or {})
+                     .get("instancesSet", {})
+                     .get("items", []))
+
+        for item in items:
+            iid = item.get("instanceId")
+            if iid:
+                result.append(InstanceEvent(
+                    event_time=event_time_str,
+                    event_name=event_name,
+                    instance_id=iid,
+                    username=username,
+                    source_ip=source_ip,
+                ))
+
+    return result
+
+
+async def list_events(region: str, creds: Credentials | None = None) -> list[InstanceEvent]:
+    cache_key = (region, creds.access_key_id if creds else "")
+    now = time.monotonic()
+    if cache_key in _events_cache:
+        fetched_at, cached = _events_cache[cache_key]
+        if now - fetched_at < CACHE_TTL:
+            return [InstanceEvent(**e) for e in cached]
+
+    session = _make_session(creds)
+    loop = asyncio.get_event_loop()
+
+    def _fetch_by_event_name(event_name: str) -> list[dict]:
+        ct_client = session.client("cloudtrail", region_name=region)
+        all_events: list[dict] = []
+        kwargs: dict = {
+            "LookupAttributes": [{"AttributeKey": "EventName", "AttributeValue": event_name}],
+            "MaxResults": 50,
+        }
+        retries, delay = 3, 1.0
+        while True:
+            try:
+                resp = ct_client.lookup_events(**kwargs)
+            except botocore.exceptions.ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("ThrottlingException", "RateExceededException") and retries > 0:
+                    time.sleep(delay)
+                    delay *= 2
+                    retries -= 1
+                    continue
+                raise
+            all_events.extend(resp.get("Events", []))
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+            kwargs["NextToken"] = next_token
+        return all_events
+
+    all_raw: list[dict] = []
+    try:
+        # Sequential to stay within CloudTrail rate limits
+        for event_name in ("RunInstances", "StartInstances", "StopInstances", "TerminateInstances"):
+            raw = await loop.run_in_executor(_executor, _fetch_by_event_name, event_name)
+            all_raw.extend(raw)
+    except botocore.exceptions.NoCredentialsError as e:
+        raise CredentialsError(str(e)) from e
+    except botocore.exceptions.ClientError as e:
+        raise AWSError(str(e)) from e
+
+    events = _parse_instance_events(all_raw)
+    events.sort(key=lambda e: e.event_time)
+    _events_cache[cache_key] = (now, [e.__dict__ for e in events])
+    return events
 
 
 def list_regions(creds: Credentials | None = None) -> list[str]:

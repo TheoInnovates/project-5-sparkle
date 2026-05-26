@@ -12,7 +12,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from sparkle.aws import AWSError, Credentials, CredentialsError, InstanceRecord, list_instances, list_regions
+from sparkle.aws import (
+    AWSError, Credentials, CredentialsError,
+    InstanceEvent, InstanceRecord,
+    list_events, list_instances, list_regions,
+)
 
 load_dotenv()
 
@@ -117,6 +121,42 @@ def get_regions(
         raise HTTPException(status_code=503, detail=f"AWS credentials not configured: {e}")
     except AWSError as e:
         raise HTTPException(status_code=502, detail=f"AWS error: {e}")
+
+
+class EventResponse(BaseModel):
+    event_time: str
+    event_name: str
+    instance_id: str
+    username: str | None
+    source_ip: str | None
+
+    @classmethod
+    def from_record(cls, e: InstanceEvent) -> "EventResponse":
+        return cls(
+            event_time=e.event_time,
+            event_name=e.event_name,
+            instance_id=e.instance_id,
+            username=e.username,
+            source_ip=e.source_ip,
+        )
+
+
+@app.get("/api/events", response_model=list[EventResponse])
+async def get_events(
+    region: str = Query(..., description="AWS region, e.g. us-east-1"),
+    x_aws_cred_source: str | None = Header(default=None),
+    x_aws_access_key_id: str | None = Header(default=None),
+    x_aws_secret_access_key: str | None = Header(default=None),
+    x_aws_session_token: str | None = Header(default=None),
+):
+    try:
+        creds = _resolve_creds(x_aws_cred_source, x_aws_access_key_id, x_aws_secret_access_key, x_aws_session_token)
+        evts = await list_events(region, creds)
+    except CredentialsError as e:
+        raise HTTPException(status_code=503, detail=f"AWS credentials not configured: {e}")
+    except AWSError as e:
+        raise HTTPException(status_code=502, detail=f"AWS error: {e}")
+    return [EventResponse.from_record(e) for e in evts]
 
 
 @app.get("/api/config")

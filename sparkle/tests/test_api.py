@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from sparkle.aws import AWSError, CredentialsError, InstanceRecord
+from sparkle.aws import AWSError, CredentialsError, InstanceEvent, InstanceRecord
 from sparkle.server.app import app
 
 client = TestClient(app)
@@ -157,3 +157,41 @@ def test_no_cred_source_header_defaults_to_local():
         r = client.get("/api/instances?region=us-east-1")
     assert r.status_code == 200
     assert captured["creds"] is None
+
+
+_sample_event = InstanceEvent(
+    event_time="2026-05-01T12:00:00+00:00",
+    event_name="RunInstances",
+    instance_id="i-0abc123def456789a",
+    username="alice",
+    source_ip="10.0.0.1",
+)
+
+
+def test_get_events_success():
+    with patch("sparkle.server.app.list_events", new=AsyncMock(return_value=[_sample_event])):
+        r = client.get("/api/events?region=us-east-1")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 1
+    assert data[0]["event_name"] == "RunInstances"
+    assert data[0]["instance_id"] == "i-0abc123def456789a"
+    assert data[0]["username"] == "alice"
+    assert data[0]["source_ip"] == "10.0.0.1"
+
+
+def test_get_events_missing_region():
+    r = client.get("/api/events")
+    assert r.status_code == 422
+
+
+def test_get_events_credentials_error():
+    with patch("sparkle.server.app.list_events", new=AsyncMock(side_effect=CredentialsError("no creds"))):
+        r = client.get("/api/events?region=us-east-1")
+    assert r.status_code == 503
+
+
+def test_get_events_aws_error():
+    with patch("sparkle.server.app.list_events", new=AsyncMock(side_effect=AWSError("bad region"))):
+        r = client.get("/api/events?region=bad-region")
+    assert r.status_code == 502
