@@ -54,15 +54,23 @@ Open [http://localhost:8000](http://localhost:8000).
 
 The frontend is pre-built. For a live-reload dev setup see [Development](#development).
 
-## AWS credentials
+## AWS credentials and region
 
-The UI offers three credential sources, selectable via the lock button in the header:
+Click the lock button in the header to open the credentials panel. It controls both the credential source and the default region.
+
+**Credential source**
 
 | Source | How it works |
 |---|---|
 | **Local / Profile** | boto3 default chain — `~/.aws/credentials`, env vars, IAM role |
 | **.env file** | Uses `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` set in the server's `.env` |
 | **Manual entry** | Enter keys directly; stored in `sessionStorage` (cleared on tab close) |
+
+**Default Region**
+
+Type any region code (e.g. `eu-west-1`) into the Default Region field and click Apply. The toolbar region selector updates immediately and the saved value is restored on page refresh, taking priority over `AWS_DEFAULT_REGION` in `.env`. Reset clears it back to the server default.
+
+The region can also be changed at any time from the toolbar dropdown without opening the panel — the panel field is only needed when you want the choice to persist across refreshes.
 
 ## CLI
 
