@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { getConfig, listInstances, listRegions } from '$lib/api';
+	import { getConfig, listInstances, listRegions, loadCredConfig } from '$lib/api';
 	import type { InstanceRecord } from '$lib/types';
 
 	let region = $state('us-east-1');
@@ -91,6 +91,11 @@
 	}
 
 	function onCredentialsSaved() {
+		const stored = loadCredConfig();
+		if (stored.region) {
+			region = stored.region;
+			if (!regions.includes(region)) regions = [region, ...regions];
+		}
 		instances = [];
 		loadInstances();
 		startAutoRefresh();
@@ -99,10 +104,13 @@
 	onMount(async () => {
 		try {
 			const [cfg, regs] = await Promise.all([getConfig(), listRegions()]);
-			region = cfg.default_region;
-			regions = regs;
+			const stored = loadCredConfig();
+			region = stored.region || cfg.default_region;
+			regions = regs.includes(region) ? regs : [region, ...regs];
 		} catch {
-			regions = ['us-east-1'];
+			const stored = loadCredConfig();
+			region = stored.region || 'us-east-1';
+			regions = [region];
 		}
 		await loadInstances();
 		startAutoRefresh();
