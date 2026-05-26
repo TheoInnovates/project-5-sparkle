@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import boto3
+import botocore.config
 import botocore.exceptions
+
+_BOTO_CONFIG = botocore.config.Config(
+    connect_timeout=5,
+    read_timeout=30,
+    retries={"max_attempts": 1},
+)
 
 CACHE_TTL = 300  # seconds
 # Cache key: (region, access_key_id_or_empty)
@@ -60,7 +67,7 @@ def _make_session(creds: Credentials | None) -> boto3.Session:
 
 def _get_ec2_instances(region: str, creds: Credentials | None) -> list[dict]:
     session = _make_session(creds)
-    ec2 = session.client("ec2", region_name=region)
+    ec2 = session.client("ec2", region_name=region, config=_BOTO_CONFIG)
     paginator = ec2.get_paginator("describe_instances")
     instances = []
     for page in paginator.paginate():
@@ -74,7 +81,7 @@ def _lookup_first_run(
 ) -> tuple[str | None, str | None]:
     """Return (first_started_iso, username) from CloudTrail, or (None, None)."""
     session = _make_session(creds)
-    ct = session.client("cloudtrail", region_name=region)
+    ct = session.client("cloudtrail", region_name=region, config=_BOTO_CONFIG)
     run_events: list[dict] = []
     kwargs: dict = {
         "LookupAttributes": [{"AttributeKey": "ResourceName", "AttributeValue": instance_id}],
@@ -270,7 +277,7 @@ async def list_events(region: str, creds: Credentials | None = None) -> list[Ins
     loop = asyncio.get_event_loop()
 
     def _fetch_by_event_name(event_name: str) -> list[dict]:
-        ct_client = session.client("cloudtrail", region_name=region)
+        ct_client = session.client("cloudtrail", region_name=region, config=_BOTO_CONFIG)
         all_events: list[dict] = []
         kwargs: dict = {
             "LookupAttributes": [{"AttributeKey": "EventName", "AttributeValue": event_name}],
@@ -314,7 +321,7 @@ async def list_events(region: str, creds: Credentials | None = None) -> list[Ins
 
 def list_regions(creds: Credentials | None = None) -> list[str]:
     session = _make_session(creds)
-    ec2 = session.client("ec2", region_name="us-east-1")
+    ec2 = session.client("ec2", region_name="us-east-1", config=_BOTO_CONFIG)
     resp = ec2.describe_regions(
         Filters=[{"Name": "opt-in-status", "Values": ["opt-in-not-required", "opted-in"]}]
     )

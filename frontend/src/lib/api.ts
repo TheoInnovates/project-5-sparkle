@@ -30,13 +30,22 @@ function credHeaders(config: CredConfig): Record<string, string> {
 	return h;
 }
 
-async function apiFetch<T>(path: string, config: CredConfig = loadCredConfig()): Promise<T> {
-	const res = await fetch(path, { headers: credHeaders(config) });
-	if (!res.ok) {
-		const body = await res.json().catch(() => ({ detail: res.statusText }));
-		throw new Error(body.detail ?? res.statusText);
+async function apiFetch<T>(path: string, config: CredConfig = loadCredConfig(), timeoutMs = 15000): Promise<T> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const res = await fetch(path, { headers: credHeaders(config), signal: controller.signal });
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({ detail: res.statusText }));
+			throw new Error(body.detail ?? res.statusText);
+		}
+		return res.json() as Promise<T>;
+	} catch (e) {
+		if (e instanceof DOMException && e.name === 'AbortError') throw new Error('Request timed out');
+		throw e;
+	} finally {
+		clearTimeout(timer);
 	}
-	return res.json() as Promise<T>;
 }
 
 export const listInstances = (region: string): Promise<InstanceRecord[]> =>

@@ -282,19 +282,24 @@
 	// ── Lifecycle ────────────────────────────────────────────────────────────
 
 	onMount(async () => {
-		try {
-			const [cfg, regs] = await Promise.all([getConfig(), listRegions()]);
-			const stored = loadCredConfig();
-			region = stored.region || cfg.default_region;
-			regions = regs.includes(region) ? regs : [region, ...regs];
-		} catch {
-			const stored = loadCredConfig();
-			region = stored.region || 'us-east-1';
-			regions = [region];
-		}
-		await loadInstances();
+		// Apply stored region immediately so the dropdown is never blank
+		const stored = loadCredConfig();
+		region = stored.region || 'us-east-1';
+		regions = [region];
+
+		// Start loading instances right away — don't block on regions/config fetch
+		loadInstances();
 		startAutoRefresh();
 		window.addEventListener('sparkle:credentials-saved', onCredentialsSaved);
+
+		// Populate region dropdown and server-default region in the background
+		getConfig()
+			.then(cfg => { if (!stored.region) region = cfg.default_region; })
+			.catch(() => {});
+
+		listRegions()
+			.then(regs => { regions = regs.includes(region) ? regs : [region, ...regs]; })
+			.catch(() => {});
 	});
 
 	onDestroy(() => {
