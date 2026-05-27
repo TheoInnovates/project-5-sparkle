@@ -628,6 +628,125 @@
 		triggerDownload(new Blob([csv], { type: 'text/csv' }), `sparkle-instances-${region}-${today()}.csv`);
 	}
 
+	async function exportInstancesExcel() {
+		const XLSX = await import('xlsx');
+		const wb = XLSX.utils.book_new();
+
+		// Sheet 1 — Summary
+		const summaryRows = [
+			['Sparkle — Instance Report'],
+			['Region', region],
+			['Generated', new Date().toLocaleString()],
+			[],
+			['State', 'Count'],
+			['Running',    stateCounts.running],
+			['Stopped',    stateCounts.stopped],
+			['Terminated', stateCounts.terminated],
+			['Other',      stateCounts.other],
+			['Total (filtered)', sortedInstances.length],
+		];
+		XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryRows), 'Summary');
+
+		// Sheet 2 — Instances
+		const instHeaders = ['Name','Instance ID','State','Type','AZ','Launch Time','First Started','First Started By','Last Started','Last Started By','Last Stopped','Last Stopped By','Terminated','Terminated By','Private IP','Public IP','VPC','Subnet','AMI','Key Pair','IAM Profile','Architecture','Tags'];
+		const instRows = sortedInstances.map(i => [
+			i.name, i.instance_id, i.state, i.instance_type, i.availability_zone,
+			i.launch_time, i.first_started ?? '', i.username ?? '',
+			i.last_started ?? '', i.last_started_by ?? '',
+			i.last_stopped ?? '', i.last_stopped_by ?? '',
+			i.last_terminated ?? '', i.last_terminated_by ?? '',
+			i.private_ip ?? '', i.public_ip ?? '', i.vpc_id ?? '', i.subnet_id ?? '',
+			i.image_id ?? '', i.key_name ?? '', i.iam_profile ?? '', i.architecture ?? '',
+			(i.tags ?? []).map(t => `${t.Key}=${t.Value}`).join(';'),
+		]);
+		XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([instHeaders, ...instRows]), 'Instances');
+
+		// Sheet 3 — Events (only if loaded)
+		if (eventsLoaded && activeEvents.length > 0) {
+			const evtHeaders = ['Time','Event','Instance ID','Instance Name','Username','Source IP'];
+			const evtRows = activeEvents.map(e => [
+				e.event_time, e.event_name, e.instance_id,
+				instanceNameMap[e.instance_id] ?? e.instance_id,
+				e.username ?? '', e.source_ip ?? '',
+			]);
+			XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([evtHeaders, ...evtRows]), 'Events');
+		}
+
+		XLSX.writeFile(wb, `sparkle-report-${region}-${today()}.xlsx`);
+	}
+
+	async function exportInstancesPDF() {
+		const { jsPDF } = await import('jspdf');
+		const { default: autoTable } = await import('jspdf-autotable');
+
+		const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+		const d = () => (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable?.finalY ?? 30;
+
+		// Header
+		doc.setFontSize(16); doc.setTextColor(30);
+		doc.text('Sparkle — Instance Report', 14, 15);
+		doc.setFontSize(9); doc.setTextColor(100);
+		doc.text(`Region: ${region}`, 14, 21);
+		doc.text(`Generated: ${new Date().toLocaleString()}`, 14, 26);
+
+		// Summary
+		doc.setFontSize(11); doc.setTextColor(30);
+		doc.text('Summary', 14, 34);
+		autoTable(doc, {
+			startY: 37,
+			head: [['Running', 'Stopped', 'Terminated', 'Other', 'Total (filtered)']],
+			body: [[stateCounts.running, stateCounts.stopped, stateCounts.terminated, stateCounts.other, sortedInstances.length]],
+			theme: 'grid',
+			headStyles: { fillColor: [41, 98, 180], fontSize: 9 },
+			bodyStyles: { fontSize: 9 },
+			tableWidth: 130,
+		});
+
+		// Instances table
+		const instY = d() + 8;
+		doc.setFontSize(11); doc.setTextColor(30);
+		doc.text('Instances', 14, instY);
+		autoTable(doc, {
+			startY: instY + 3,
+			head: [['Name','Instance ID','State','Type','AZ','Launch Time','First Started','Last Started','Last Stopped']],
+			body: sortedInstances.map(i => [
+				i.name, i.instance_id, i.state, i.instance_type, i.availability_zone,
+				fmtDate(i.launch_time) || '—',
+				fmtDate(i.first_started) || '—',
+				fmtDate(i.last_started)  || '—',
+				fmtDate(i.last_stopped)  || '—',
+			]),
+			theme: 'striped',
+			headStyles: { fillColor: [41, 98, 180], fontSize: 8 },
+			bodyStyles: { fontSize: 7 },
+			alternateRowStyles: { fillColor: [245, 247, 250] },
+		});
+
+		// Events page (only if loaded)
+		if (eventsLoaded && activeEvents.length > 0) {
+			doc.addPage();
+			doc.setFontSize(16); doc.setTextColor(30);
+			doc.text('CloudTrail Events', 14, 15);
+			doc.setFontSize(9); doc.setTextColor(100);
+			doc.text(`Region: ${region}  ·  ${activeEvents.length} events`, 14, 21);
+			autoTable(doc, {
+				startY: 26,
+				head: [['Time','Event','Instance ID','Instance Name','Username','Source IP']],
+				body: activeEvents.map(e => [
+					fmtDate(e.event_time), e.event_name, e.instance_id,
+					instanceNameMap[e.instance_id] ?? e.instance_id,
+					e.username ?? '—', e.source_ip ?? '—',
+				]),
+				theme: 'striped',
+				headStyles: { fillColor: [41, 98, 180], fontSize: 8 },
+				bodyStyles: { fontSize: 7 },
+				alternateRowStyles: { fillColor: [245, 247, 250] },
+			});
+		}
+
+		doc.save(`sparkle-report-${region}-${today()}.pdf`);
+	}
+
 	function triggerDownload(blob: Blob, filename: string) {
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
@@ -859,7 +978,31 @@
 				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 					<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
 				</svg>
-				Export CSV
+				CSV
+			</button>
+			<button
+				onclick={exportInstancesExcel}
+				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium border transition-colors"
+				style="border-color: var(--color-border); color: var(--color-text);"
+				title="Export report as Excel (.xlsx) — includes Summary, Instances, and Events sheets"
+			>
+				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+					<line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/>
+				</svg>
+				Excel
+			</button>
+			<button
+				onclick={exportInstancesPDF}
+				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium border transition-colors"
+				style="border-color: var(--color-border); color: var(--color-text);"
+				title="Export report as PDF — includes summary stats, instance table, and events (if loaded)"
+			>
+				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+					<line x1="9" y1="15" x2="15" y2="15"/>
+				</svg>
+				PDF
 			</button>
 		{/if}
 
