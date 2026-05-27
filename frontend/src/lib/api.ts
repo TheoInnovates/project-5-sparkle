@@ -1,4 +1,4 @@
-import type { Config, CredConfig, InstanceEvent, InstanceRecord } from './types';
+import type { Config, CredConfig, EBSVolume, InstanceEvent, InstanceRecord, TagResource } from './types';
 
 const STORAGE_KEY = 'sparkle_cred_config';
 
@@ -91,6 +91,15 @@ export const updateTags = (
 		30000,
 		{ method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upsert, delete_keys: deleteKeys }) },
 	);
+
+export const searchByTag = (region: string, key: string, value?: string): Promise<TagResource[]> => {
+	const qs = new URLSearchParams({ region, key });
+	if (value) qs.set('value', value);
+	return apiFetch<TagResource[]>(`/api/tag-search?${qs}`, loadCredConfig(), 30000);
+};
+
+export const listVolumes = (region: string): Promise<EBSVolume[]> =>
+	apiFetch<EBSVolume[]>(`/api/volumes?region=${encodeURIComponent(region)}`, loadCredConfig(), 30000);
 
 export interface S3QueryParams {
 	bucket: string;

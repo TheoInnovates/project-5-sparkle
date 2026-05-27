@@ -489,6 +489,74 @@ async def fetch_s3_events(
     return events
 
 
+def search_resources_by_tag(
+    key: str,
+    value: str | None,
+    region: str,
+    creds: Credentials | None,
+) -> list[dict]:
+    """Return all tagged resources matching key (and optionally value) via Resource Groups Tagging API."""
+    session = _make_session(creds)
+    client = session.client("resourcegroupstaggingapi", region_name=region, config=_BOTO_CONFIG)
+    tag_filter: dict = {"Key": key}
+    if value:
+        tag_filter["Values"] = [value]
+    results: list[dict] = []
+    try:
+        paginator = client.get_paginator("get_resources")
+        for page in paginator.paginate(TagFilters=[tag_filter]):
+            for r in page.get("ResourceTagMappingList", []):
+                arn = r["ResourceARN"]
+                parts = arn.split(":")
+                service = parts[2] if len(parts) > 2 else "unknown"
+                resource_part = parts[-1] if parts else arn
+                name_tag = next((t["Value"] for t in r.get("Tags", []) if t["Key"] == "Name"), None)
+                results.append({
+                    "arn": arn,
+                    "service": service,
+                    "resource": resource_part,
+                    "name": name_tag,
+                    "tags": r.get("Tags", []),
+                })
+    except botocore.exceptions.NoCredentialsError as e:
+        raise CredentialsError(str(e)) from e
+    except botocore.exceptions.ClientError as e:
+        raise AWSError(str(e)) from e
+    return results
+
+
+def list_volumes(region: str, creds: Credentials | None) -> list[dict]:
+    """Return all EBS volumes in the region."""
+    session = _make_session(creds)
+    ec2 = session.client("ec2", region_name=region, config=_BOTO_CONFIG)
+    vols: list[dict] = []
+    try:
+        paginator = ec2.get_paginator("describe_volumes")
+        for page in paginator.paginate():
+            for v in page.get("Volumes", []):
+                name_tag = next((t["Value"] for t in v.get("Tags", []) if t["Key"] == "Name"), None)
+                vols.append({
+                    "volume_id": v["VolumeId"],
+                    "state": v["State"],
+                    "size_gb": v["Size"],
+                    "volume_type": v["VolumeType"],
+                    "iops": v.get("Iops"),
+                    "throughput": v.get("Throughput"),
+                    "create_time": v["CreateTime"].isoformat(),
+                    "name": name_tag,
+                    "attachments": [
+                        {"instance_id": a["InstanceId"], "device": a["Device"]}
+                        for a in v.get("Attachments", [])
+                    ],
+                    "tags": v.get("Tags", []),
+                })
+    except botocore.exceptions.NoCredentialsError as e:
+        raise CredentialsError(str(e)) from e
+    except botocore.exceptions.ClientError as e:
+        raise AWSError(str(e)) from e
+    return vols
+
+
 class CredentialsError(Exception):
     pass
 

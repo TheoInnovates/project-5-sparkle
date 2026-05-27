@@ -25,6 +25,28 @@ export interface InstanceRecord {
 	iam_profile: string | null;
 	architecture: string | null;
 	tags: { Key: string; Value: string }[] | null;
+	region?: string;
+}
+
+export interface TagResource {
+	arn: string;
+	service: string;
+	resource: string;
+	name: string | null;
+	tags: { Key: string; Value: string }[];
+}
+
+export interface EBSVolume {
+	volume_id: string;
+	state: string;
+	size_gb: number;
+	volume_type: string;
+	iops: number | null;
+	throughput: number | null;
+	create_time: string;
+	name: string | null;
+	attachments: { instance_id: string; device: string }[];
+	tags: { Key: string; Value: string }[];
 }
 
 export type CredSource = 'local' | 'env' | 'manual';

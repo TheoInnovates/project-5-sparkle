@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { fetchS3Events, getConfig, listEvents, listInstances, listRegions, loadCredConfig, rebootInstance, startInstance, stopInstance, terminateInstance, updateTags } from '$lib/api';
-	import type { InstanceEvent, InstanceRecord } from '$lib/types';
+	import { fetchS3Events, getConfig, listEvents, listInstances, listRegions, listVolumes, loadCredConfig, rebootInstance, searchByTag, startInstance, stopInstance, terminateInstance, updateTags } from '$lib/api';
+	import type { EBSVolume, InstanceEvent, InstanceRecord, TagResource } from '$lib/types';
+	import { estimateInstanceCostPerMonth, estimateEBSCostPerMonth, fmtCost } from '$lib/prices';
 
 	let region = $state('us-east-1');
 	let regions = $state<string[]>([]);
@@ -13,7 +14,31 @@
 	let lastRefreshed = $state<Date | null>(null);
 	let autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
-	let activeTab = $state<'instances' | 'timeline' | 'lifetime'>('instances');
+	let activeTab = $state<'instances' | 'timeline' | 'lifetime' | 'resources'>('instances');
+	let extraRegions = $state<string[]>([]);
+	let addRegionOpen = $state(false);
+	let scanAllLoading = $state(false);
+
+	// ── Tag / Resource search ─────────────────────────────────────────────────
+	let tagKey = $state('');
+	let tagValue = $state('');
+	let tagResults = $state<TagResource[]>([]);
+	let tagLoading = $state(false);
+	let tagError = $state<string | null>(null);
+	let tagSearched = $state(false);
+
+	// ── EBS volumes ───────────────────────────────────────────────────────────
+	let volumes = $state<EBSVolume[]>([]);
+	let volumesLoading = $state(false);
+	let volumesLoaded = $state(false);
+	let volumesError = $state<string | null>(null);
+
+	// ── Tag compliance ────────────────────────────────────────────────────────
+	let requiredTagsInput = $state('');
+	const requiredTags = $derived(
+		requiredTagsInput.split(',').map(s => s.trim()).filter(Boolean)
+	);
+
 	let events = $state<InstanceEvent[]>([]);
 	let eventsLoading = $state(false);
 	let eventsError = $state<string | null>(null);
@@ -234,6 +259,7 @@
 	let filterStates = $state<Set<string>>(new Set());
 	let filterType = $state('');
 	let filterAZ = $state('');
+	let filterMissingTags = $state(false);
 
 	const distinctTypes = $derived([...new Set(enrichedInstances.map(i => i.instance_type))].sort());
 	const distinctAZs = $derived([...new Set(enrichedInstances.map(i => i.availability_zone))].sort());
@@ -247,6 +273,10 @@
 			if (filterStates.size > 0 && !filterStates.has(inst.state)) return false;
 			if (filterType && inst.instance_type !== filterType) return false;
 			if (filterAZ && inst.availability_zone !== filterAZ) return false;
+			if (filterMissingTags && requiredTags.length > 0) {
+				const have = new Set((inst.tags ?? []).map(t => t.Key));
+				if (requiredTags.every(k => have.has(k))) return false;
+			}
 			return true;
 		})
 	);
@@ -269,10 +299,11 @@
 		filterStates = new Set();
 		filterType = '';
 		filterAZ = '';
+		filterMissingTags = false;
 	}
 
 	const hasActiveFilters = $derived(
-		searchText !== '' || filterStates.size > 0 || filterType !== '' || filterAZ !== ''
+		searchText !== '' || filterStates.size > 0 || filterType !== '' || filterAZ !== '' || filterMissingTags
 	);
 
 	// ── Column Sorting ────────────────────────────────────────────────────────
@@ -297,6 +328,7 @@
 			else if (sortCol === 'started') { av = a.first_started ?? ''; bv = b.first_started ?? ''; }
 			else if (sortCol === 'username') { av = a.username ?? ''; bv = b.username ?? ''; }
 			else if (sortCol === 'stopped') { av = a.last_stopped ?? ''; bv = b.last_stopped ?? ''; }
+			else if (sortCol === 'region') { av = a.region ?? ''; bv = b.region ?? ''; }
 			return av.localeCompare(bv) * dir;
 		})
 	);
@@ -304,6 +336,7 @@
 	// ── Column visibility ─────────────────────────────────────────────────────
 	const ALL_COLUMNS = [
 		{ key: 'name',       label: 'Name',         sort: 'name',     evt: false },
+		{ key: 'region',     label: 'Region',        sort: 'region',   evt: false },
 		{ key: 'id',         label: 'Instance ID',  sort: 'id',       evt: false },
 		{ key: 'state',      label: 'State',        sort: 'state',    evt: false },
 		{ key: 'type',       label: 'Type',         sort: 'type',     evt: false },
@@ -312,13 +345,25 @@
 		{ key: 'started',    label: 'First Started',sort: 'started',  evt: true  },
 		{ key: 'username',   label: 'Username',     sort: 'username', evt: true  },
 		{ key: 'stopped',    label: 'Last Stopped', sort: 'stopped',  evt: true  },
+		{ key: 'cost',       label: 'Est. Cost/mo', sort: null,       evt: false },
+		{ key: 'compliance', label: 'Tag Compliance',sort: null,      evt: false },
 		{ key: 'private_ip', label: 'Private IP',   sort: null,       evt: false },
 		{ key: 'public_ip',  label: 'Public IP',    sort: null,       evt: false },
 		{ key: 'vpc',        label: 'VPC',          sort: null,       evt: false },
 		{ key: 'iam',        label: 'IAM Profile',  sort: null,       evt: false },
 	];
 
-	let visibleCols = $state(new Set(['name','id','state','type','az','launch','started','username','stopped']));
+	const DEFAULT_COLS = new Set(['name','id','state','type','az','launch','started','username','stopped']);
+
+	// Auto-include 'region' column when multiple regions are loaded
+	const effectiveVisibleCols = $derived.by(() => {
+		const cols = new Set(visibleCols);
+		if (extraRegions.length > 0) cols.add('region');
+		else cols.delete('region');
+		return cols;
+	});
+
+	let visibleCols = $state(new Set([...DEFAULT_COLS]));
 	let colPickerOpen = $state(false);
 
 	function toggleCol(key: string) {
@@ -328,7 +373,36 @@
 		visibleCols = next;
 	}
 
-	const tableColspan = $derived(visibleCols.size + 1);
+	const tableColspan = $derived(effectiveVisibleCols.size + 1);
+
+	// ── Waste / Cost ──────────────────────────────────────────────────────────
+	const wasteFlags = $derived({
+		longRunning: sortedInstances.filter(i => {
+			if (i.state !== 'running') return false;
+			return Date.now() - new Date(i.launch_time).getTime() > 30 * 86400000;
+		}),
+		stoppedInstances: sortedInstances.filter(i => i.state === 'stopped'),
+		neverTagged: sortedInstances.filter(i => !(i.tags?.length)),
+	});
+
+	const unattachedVolumes = $derived(volumes.filter(v => v.state === 'available'));
+
+	const estimatedMonthlyCost = $derived(
+		sortedInstances
+			.filter(i => i.state === 'running')
+			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type) ?? 0), 0)
+	);
+
+	const unattachedEBSWaste = $derived(
+		unattachedVolumes.reduce((sum, v) => sum + estimateEBSCostPerMonth(v.volume_type, v.size_gb), 0)
+	);
+
+	// ── Tag compliance per instance ───────────────────────────────────────────
+	function missingTags(inst: typeof enrichedInstances[0]): string[] {
+		if (!requiredTags.length) return [];
+		const have = new Set((inst.tags ?? []).map(t => t.Key));
+		return requiredTags.filter(k => !have.has(k));
+	}
 
 	// ── Copy to clipboard ─────────────────────────────────────────────────────
 	let copiedValue = $state<string | null>(null);
@@ -538,13 +612,22 @@
 			refreshing = true;
 		}
 		error = null;
+		const allRegions = [region, ...extraRegions];
 		const t0 = Date.now();
-		addLog('info', 'instances', `Fetching instances for ${region}…`);
+		addLog('info', 'instances', `Fetching instances for ${allRegions.join(', ')}…`);
 		try {
-			instances = await listInstances(region);
+			const results = await Promise.allSettled(allRegions.map(r => listInstances(r)));
+			const merged: InstanceRecord[] = [];
+			results.forEach((r, i) => {
+				if (r.status === 'fulfilled') {
+					merged.push(...r.value.map(inst => ({ ...inst, region: allRegions[i] })));
+				} else {
+					addLog('warn', 'instances', `Failed to load ${allRegions[i]}: ${r.reason instanceof Error ? r.reason.message : r.reason}`);
+				}
+			});
+			instances = merged;
 			lastRefreshed = new Date();
-			addLog('info', 'instances', `Loaded ${instances.length} instance${instances.length !== 1 ? 's' : ''} from ${region}`, Date.now() - t0);
-			// Auto-load CloudTrail events in background to enrich First Started / Username columns
+			addLog('info', 'instances', `Loaded ${instances.length} instance${instances.length !== 1 ? 's' : ''} from ${allRegions.length} region${allRegions.length !== 1 ? 's' : ''}`, Date.now() - t0);
 			if (!eventsLoaded && !eventsLoading && importSource === 'api') loadEventsData();
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
@@ -553,6 +636,57 @@
 		} finally {
 			loading = false;
 			refreshing = false;
+		}
+	}
+
+	async function scanAllRegions() {
+		scanAllLoading = true;
+		addLog('info', 'regions', 'Scanning all regions…');
+		try {
+			const all = await listRegions(region);
+			extraRegions = all.filter(r => r !== region);
+			await loadInstances();
+		} catch (e) {
+			addLog('warn', 'regions', `Scan all failed: ${e instanceof Error ? e.message : e}`);
+		} finally {
+			scanAllLoading = false;
+		}
+	}
+
+	async function runTagSearch() {
+		if (!tagKey.trim()) return;
+		tagLoading = true;
+		tagError = null;
+		tagSearched = true;
+		const t0 = Date.now();
+		addLog('info', 'tag-search', `Searching for tag ${tagKey}${tagValue ? '=' + tagValue : ''} in ${region}…`);
+		try {
+			tagResults = await searchByTag(region, tagKey.trim(), tagValue.trim() || undefined);
+			addLog('info', 'tag-search', `Found ${tagResults.length} resources`, Date.now() - t0);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			tagError = msg;
+			addLog('error', 'tag-search', msg, Date.now() - t0);
+		} finally {
+			tagLoading = false;
+		}
+	}
+
+	async function loadVolumes() {
+		volumesLoading = true;
+		volumesError = null;
+		const t0 = Date.now();
+		addLog('info', 'volumes', `Fetching EBS volumes for ${region}…`);
+		try {
+			volumes = await listVolumes(region);
+			volumesLoaded = true;
+			addLog('info', 'volumes', `Loaded ${volumes.length} volume${volumes.length !== 1 ? 's' : ''}`, Date.now() - t0);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			volumesError = msg;
+			addLog('error', 'volumes', msg, Date.now() - t0);
+		} finally {
+			volumesLoading = false;
 		}
 	}
 
@@ -597,7 +731,7 @@
 		autoRefresh ? startAutoRefresh() : stopAutoRefresh();
 	}
 
-	async function switchTab(tab: 'instances' | 'timeline' | 'lifetime') {
+	async function switchTab(tab: 'instances' | 'timeline' | 'lifetime' | 'resources') {
 		activeTab = tab;
 		if ((tab === 'timeline' || tab === 'lifetime') && importSource === 'api' && !eventsLoaded && !eventsLoading) {
 			await loadEventsData();
@@ -965,7 +1099,7 @@
 
 <!-- Toolbar -->
 <div class="flex flex-wrap items-center gap-3 mb-0 pb-0">
-	<div class="flex items-center gap-2">
+	<div class="flex items-center gap-2 flex-wrap">
 		<label for="region-select" class="text-sm font-medium" style="color: var(--color-muted);">Region</label>
 		<select
 			id="region-select"
@@ -978,6 +1112,42 @@
 				<option value={r}>{r}</option>
 			{/each}
 		</select>
+		{#each extraRegions as r}
+			<span class="flex items-center gap-1 rounded px-2 py-0.5 text-xs font-medium" style="background-color: var(--color-accent)22; color: var(--color-accent); border: 1px solid var(--color-accent)44;">
+				{r}
+				<button onclick={() => { extraRegions = extraRegions.filter(x => x !== r); loadInstances(); }} style="opacity:0.7;" title="Remove region">✕</button>
+			</span>
+		{/each}
+		<div class="relative">
+			<button
+				onclick={() => addRegionOpen = !addRegionOpen}
+				class="text-xs rounded px-2 py-1 border transition-colors"
+				style="border-color: var(--color-border); color: var(--color-muted);"
+				title="Add another region"
+			>+ Region</button>
+			{#if addRegionOpen}
+				<div class="fixed inset-0 z-40" role="presentation" onclick={() => addRegionOpen = false}></div>
+				<div class="absolute left-0 top-full mt-1 z-50 rounded border shadow-xl py-1 max-h-64 overflow-y-auto min-w-44"
+					style="background-color: var(--color-surface); border-color: var(--color-border);">
+					{#each regions.filter(r => r !== region && !extraRegions.includes(r)) as r}
+						<button
+							onclick={() => { extraRegions = [...extraRegions, r]; addRegionOpen = false; loadInstances(); }}
+							class="block w-full text-left px-3 py-1.5 text-xs hover:opacity-80"
+						>{r}</button>
+					{/each}
+				</div>
+			{/if}
+		</div>
+		<button
+			onclick={scanAllRegions}
+			disabled={scanAllLoading}
+			class="text-xs rounded px-2 py-1 border transition-colors disabled:opacity-50"
+			style="border-color: var(--color-border); color: var(--color-muted);"
+			title="Query all available regions simultaneously"
+		>{scanAllLoading ? 'Scanning…' : 'Scan All'}</button>
+		{#if extraRegions.length > 0}
+			<button onclick={() => { extraRegions = []; loadInstances(); }} class="text-xs" style="color: var(--color-muted);">Clear</button>
+		{/if}
 	</div>
 
 	{#if activeTab === 'instances'}
@@ -1020,7 +1190,7 @@
 						<label class="flex items-center gap-2.5 px-3 py-1.5 text-xs cursor-pointer select-none hover:opacity-80">
 							<input
 								type="checkbox"
-								checked={visibleCols.has(col.key)}
+								checked={effectiveVisibleCols.has(col.key)}
 								onchange={() => toggleCol(col.key)}
 								class="rounded"
 							/>
@@ -1270,6 +1440,13 @@
 	>
 		Lifetime
 	</button>
+	<button
+		onclick={() => switchTab('resources')}
+		class="px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors"
+		style="border-color: {activeTab === 'resources' ? 'var(--color-accent)' : 'transparent'}; color: {activeTab === 'resources' ? 'var(--color-text)' : 'var(--color-muted)'};"
+	>
+		Resources
+	</button>
 </div>
 
 <!-- ── INSTANCES TAB ── -->
@@ -1300,6 +1477,22 @@
 			<option value="">All AZs</option>
 			{#each distinctAZs as az}<option value={az}>{az}</option>{/each}
 		</select>
+		<input
+			type="text"
+			placeholder="Required tags (Owner,Env…)"
+			bind:value={requiredTagsInput}
+			class="rounded px-2 py-1.5 text-sm border w-44"
+			style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);"
+			title="Comma-separated tag keys that all instances should have. Enables compliance column and filter."
+		/>
+		{#if requiredTags.length > 0}
+			<button
+				onclick={() => filterMissingTags = !filterMissingTags}
+				class="text-xs rounded px-2.5 py-1.5 border transition-colors"
+				style="border-color: {filterMissingTags ? '#f59e0b' : 'var(--color-border)'}; color: {filterMissingTags ? '#f59e0b' : 'var(--color-muted)'};"
+				title="Show only instances missing required tags"
+			>Non-compliant</button>
+		{/if}
 		{#if hasActiveFilters}
 			<button onclick={clearFilters} class="text-xs rounded px-2.5 py-1.5 border transition-colors" style="border-color: var(--color-border); color: var(--color-muted);">Clear filters</button>
 		{/if}
@@ -1336,13 +1529,85 @@
 		</div>
 	{/if}
 
+	<!-- Cost / Waste panel -->
+	{#if !loading && instances.length > 0 && (wasteFlags.longRunning.length > 0 || wasteFlags.stoppedInstances.length > 0 || wasteFlags.neverTagged.length > 0 || volumesLoaded)}
+		<div class="rounded-lg border mb-3 p-3 text-xs" style="border-color: #f59e0b44; background-color: #f59e0b08;">
+			<div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+				<span class="font-semibold" style="color: #f59e0b;">Cost &amp; Waste</span>
+				{#if estimatedMonthlyCost > 0}
+					<span style="color: var(--color-text);">~{fmtCost(estimatedMonthlyCost)}/mo running</span>
+				{/if}
+				{#if wasteFlags.longRunning.length > 0}
+					<button onclick={() => { filterStates = new Set(['running']); }} class="flex items-center gap-1" style="color: #f59e0b;" title="Show these instances">
+						⚠ {wasteFlags.longRunning.length} running &gt;30 days
+					</button>
+				{/if}
+				{#if wasteFlags.stoppedInstances.length > 0}
+					<button onclick={() => { filterStates = new Set(['stopped']); }} class="flex items-center gap-1" style="color: #eab308;" title="Stopped instances still incur EBS storage charges">
+						⚠ {wasteFlags.stoppedInstances.length} stopped (EBS costs)
+					</button>
+				{/if}
+				{#if wasteFlags.neverTagged.length > 0}
+					<span style="color: var(--color-muted);">⚠ {wasteFlags.neverTagged.length} untagged</span>
+				{/if}
+				{#if volumesLoaded && unattachedVolumes.length > 0}
+					<span style="color: #ef4444;">⚠ {unattachedVolumes.length} unattached volumes (~{fmtCost(unattachedEBSWaste)}/mo waste)</span>
+				{/if}
+				{#if !volumesLoaded}
+					<button
+						onclick={loadVolumes}
+						disabled={volumesLoading}
+						class="ml-auto text-xs rounded px-2 py-0.5 border transition-colors disabled:opacity-50"
+						style="border-color: var(--color-border); color: var(--color-muted);"
+					>{volumesLoading ? 'Loading…' : 'Check EBS volumes'}</button>
+				{/if}
+			</div>
+			{#if volumesLoaded && volumes.length > 0}
+				<div class="mt-3 overflow-x-auto">
+					<table class="w-full text-xs">
+						<thead>
+							<tr style="border-bottom: 1px solid var(--color-border);">
+								{#each ['Volume ID','Name','State','Size','Type','Attached To','Age','Est. Cost/mo'] as h}
+									<th class="text-left px-2 py-1.5 font-semibold" style="color: var(--color-muted);">{h}</th>
+								{/each}
+							</tr>
+						</thead>
+						<tbody>
+							{#each volumes as v}
+								{@const isWaste = v.state === 'available'}
+								{@const ageDays = Math.floor((Date.now() - new Date(v.create_time).getTime()) / 86400000)}
+								{@const cost = estimateEBSCostPerMonth(v.volume_type, v.size_gb)}
+								<tr style="border-bottom: 1px solid var(--color-border); {isWaste ? 'background-color: #f59e0b08;' : ''}">
+									<td class="px-2 py-1.5 font-mono">{v.volume_id}</td>
+									<td class="px-2 py-1.5" style="color: var(--color-muted);">{v.name ?? '—'}</td>
+									<td class="px-2 py-1.5">
+										{#if isWaste}
+											<span class="font-semibold" style="color: #f59e0b;">⚠ unattached</span>
+										{:else}
+											<span style="color: var(--color-muted);">{v.state}</span>
+										{/if}
+									</td>
+									<td class="px-2 py-1.5">{v.size_gb} GB</td>
+									<td class="px-2 py-1.5 font-mono" style="color: var(--color-muted);">{v.volume_type}</td>
+									<td class="px-2 py-1.5 font-mono text-xs" style="color: var(--color-muted);">{v.attachments.map(a => a.instance_id).join(', ') || '—'}</td>
+									<td class="px-2 py-1.5" style="color: var(--color-muted);">{ageDays}d</td>
+									<td class="px-2 py-1.5 font-medium" style="color: {isWaste ? '#f59e0b' : 'var(--color-muted)'};">~{fmtCost(cost)}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+		</div>
+	{/if}
+
 	<div class="rounded-lg border overflow-hidden" style="border-color: var(--color-border);">
 		<div class="overflow-x-auto">
 			<table class="w-full text-sm">
 				<thead>
 					<tr style="background-color: var(--color-surface); border-bottom: 1px solid var(--color-border);">
 						<th class="px-2 py-3 w-8"></th>
-						{#each ALL_COLUMNS.filter(c => visibleCols.has(c.key)) as col}
+						{#each ALL_COLUMNS.filter(c => effectiveVisibleCols.has(c.key)) as col}
 							<th
 								class="text-left px-4 py-3 font-semibold whitespace-nowrap {col.sort ? 'cursor-pointer select-none' : ''}"
 								style="color: var(--color-muted);"
@@ -1366,7 +1631,7 @@
 						{#each { length: 5 } as _}
 							<tr style="border-bottom: 1px solid var(--color-border);">
 								<td class="px-2 py-3 w-8"></td>
-								{#each { length: visibleCols.size } as _}
+								{#each { length: effectiveVisibleCols.size } as _}
 									<td class="px-4 py-3"><div class="h-4 rounded animate-pulse w-24" style="background-color: var(--color-border);"></div></td>
 								{/each}
 							</tr>
@@ -1396,8 +1661,9 @@
 								<td class="px-2 py-3 w-8 text-center">
 									<svg class="w-3.5 h-3.5 inline transition-transform" style="color: var(--color-muted); transform: rotate({isExpanded ? '90deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
 								</td>
-								{#if visibleCols.has('name')}<td class="px-4 py-3 font-medium">{inst.name}</td>{/if}
-								{#if visibleCols.has('id')}
+								{#if effectiveVisibleCols.has('name')}<td class="px-4 py-3 font-medium">{inst.name}</td>{/if}
+								{#if effectiveVisibleCols.has('region')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.region ?? region}</td>{/if}
+								{#if effectiveVisibleCols.has('id')}
 								<td class="px-4 py-3 font-mono text-xs group/iid" style="color: var(--color-muted);">
 									{inst.instance_id}
 									<button
@@ -1414,7 +1680,7 @@
 									</button>
 								</td>
 								{/if}
-								{#if visibleCols.has('state')}
+								{#if effectiveVisibleCols.has('state')}
 								<td class="px-4 py-3">
 									<span class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium"
 										style="background-color: {stateColor(inst.state)}22; color: {stateColor(inst.state)};">
@@ -1423,10 +1689,10 @@
 									</span>
 								</td>
 								{/if}
-								{#if visibleCols.has('type')}<td class="px-4 py-3" style="color: var(--color-muted);">{inst.instance_type}</td>{/if}
-								{#if visibleCols.has('az')}<td class="px-4 py-3" style="color: var(--color-muted);">{inst.availability_zone}</td>{/if}
-								{#if visibleCols.has('launch')}<td class="px-4 py-3 whitespace-nowrap" title={inst.launch_time}>{fmtDate(inst.launch_time)}</td>{/if}
-								{#if visibleCols.has('started')}
+								{#if effectiveVisibleCols.has('type')}<td class="px-4 py-3" style="color: var(--color-muted);">{inst.instance_type}</td>{/if}
+								{#if effectiveVisibleCols.has('az')}<td class="px-4 py-3" style="color: var(--color-muted);">{inst.availability_zone}</td>{/if}
+								{#if effectiveVisibleCols.has('launch')}<td class="px-4 py-3 whitespace-nowrap" title={inst.launch_time}>{fmtDate(inst.launch_time)}</td>{/if}
+								{#if effectiveVisibleCols.has('started')}
 								<td class="px-4 py-3 whitespace-nowrap">
 									{#if eventsLoading && !inst.first_started}
 										<span style="color: var(--color-muted);">···</span>
@@ -1437,7 +1703,7 @@
 									{/if}
 								</td>
 								{/if}
-								{#if visibleCols.has('username')}
+								{#if effectiveVisibleCols.has('username')}
 								<td class="px-4 py-3">
 									{#if eventsLoading && !inst.username}
 										<span style="color: var(--color-muted);">···</span>
@@ -1448,7 +1714,7 @@
 									{/if}
 								</td>
 								{/if}
-								{#if visibleCols.has('stopped')}
+								{#if effectiveVisibleCols.has('stopped')}
 								<td class="px-4 py-3 whitespace-nowrap">
 									{#if eventsLoading && !inst.last_stopped}
 										<span style="color: var(--color-muted);">···</span>
@@ -1459,10 +1725,35 @@
 									{/if}
 								</td>
 								{/if}
-								{#if visibleCols.has('private_ip')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.private_ip ?? '—'}</td>{/if}
-								{#if visibleCols.has('public_ip')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.public_ip ?? '—'}</td>{/if}
-								{#if visibleCols.has('vpc')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.vpc_id ?? '—'}</td>{/if}
-								{#if visibleCols.has('iam')}<td class="px-4 py-3 font-mono text-xs truncate max-w-xs" style="color: var(--color-muted);" title={inst.iam_profile ?? ''}>{inst.iam_profile ? shortUsername(inst.iam_profile) : '—'}</td>{/if}
+								{#if effectiveVisibleCols.has('private_ip')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.private_ip ?? '—'}</td>{/if}
+								{#if effectiveVisibleCols.has('public_ip')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.public_ip ?? '—'}</td>{/if}
+								{#if effectiveVisibleCols.has('vpc')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.vpc_id ?? '—'}</td>{/if}
+								{#if effectiveVisibleCols.has('iam')}<td class="px-4 py-3 font-mono text-xs truncate max-w-xs" style="color: var(--color-muted);" title={inst.iam_profile ?? ''}>{inst.iam_profile ? shortUsername(inst.iam_profile) : '—'}</td>{/if}
+							{#if effectiveVisibleCols.has('cost')}
+							<td class="px-4 py-3 text-xs whitespace-nowrap" style="color: var(--color-muted);">
+								{#if inst.state === 'running'}
+									<span title="Approximate on-demand Linux price, us-east-1">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type) ?? 0)}/mo</span>
+								{:else if inst.state === 'stopped'}
+									<span style="color: #eab308;" title="Stopped: no compute cost but EBS storage still billed">EBS only</span>
+								{:else}
+									<span>—</span>
+								{/if}
+							</td>
+							{/if}
+							{#if effectiveVisibleCols.has('compliance')}
+							<td class="px-4 py-3 text-xs">
+								{#if requiredTags.length === 0}
+									<span style="color: var(--color-muted);">—</span>
+								{:else}
+									{@const missing = missingTags(inst)}
+									{#if missing.length === 0}
+										<span style="color: #22c55e;" title="All required tags present">✓</span>
+									{:else}
+										<span style="color: #ef4444;" title="Missing: {missing.join(', ')}">✗ {missing.length}</span>
+									{/if}
+								{/if}
+							</td>
+							{/if}
 							</tr>
 
 							{#if isExpanded}
@@ -1964,6 +2255,123 @@
 			{/if}
 		</div>
 	{/if}
+{:else if activeTab === 'resources'}
+	<!-- Tag Resource Search -->
+	<div class="mb-4">
+		<div class="flex flex-wrap items-center gap-2 mb-3">
+			<input
+				type="text"
+				placeholder="Tag key (e.g. Owner)"
+				bind:value={tagKey}
+				onkeydown={(e) => e.key === 'Enter' && runTagSearch()}
+				class="rounded px-2.5 py-1.5 text-sm border w-44"
+				style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);"
+			/>
+			<input
+				type="text"
+				placeholder="Value (optional)"
+				bind:value={tagValue}
+				onkeydown={(e) => e.key === 'Enter' && runTagSearch()}
+				class="rounded px-2.5 py-1.5 text-sm border w-44"
+				style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);"
+			/>
+			<button
+				onclick={runTagSearch}
+				disabled={tagLoading || !tagKey.trim()}
+				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
+				style="background-color: var(--color-accent); color: white;"
+			>
+				{#if tagLoading}
+					<svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+					Searching…
+				{:else}
+					Search
+				{/if}
+			</button>
+			{#if tagSearched}
+				<button
+					onclick={() => { tagKey = ''; tagValue = ''; tagResults = []; tagSearched = false; tagError = null; }}
+					class="text-xs rounded px-2.5 py-1.5 border transition-colors"
+					style="border-color: var(--color-border); color: var(--color-muted);"
+				>Clear</button>
+			{/if}
+		</div>
+
+		{#if tagError}
+			<div class="mb-3 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">{tagError}</div>
+		{/if}
+
+		{#if tagSearched && !tagLoading}
+			<p class="text-xs mb-2" style="color: var(--color-muted);">
+				{tagResults.length} resource{tagResults.length !== 1 ? 's' : ''} found
+				{#if tagKey}matching <code class="font-mono">{tagKey}{tagValue ? '=' + tagValue : ''}</code>{/if}
+				in {region}
+			</p>
+		{/if}
+
+		{#if tagResults.length > 0}
+			<div class="rounded-lg border overflow-hidden" style="border-color: var(--color-border);">
+				<div class="overflow-x-auto">
+					<table class="w-full text-sm">
+						<thead>
+							<tr style="background-color: var(--color-surface); border-bottom: 1px solid var(--color-border);">
+								{#each ['Service','Name / Resource','ARN','Tags'] as h}
+									<th class="text-left px-4 py-3 font-semibold text-xs" style="color: var(--color-muted);">{h}</th>
+								{/each}
+							</tr>
+						</thead>
+						<tbody>
+							{#each tagResults as r (r.arn)}
+								{@const svcColors: Record<string, string> = { ec2: '#3b82f6', rds: '#f97316', lambda: '#a855f7', s3: '#eab308', ecs: '#06b6d4', eks: '#6366f1', elb: '#22c55e', elasticloadbalancing: '#22c55e', sns: '#ec4899', sqs: '#14b8a6', dynamodb: '#f43f5e' }}
+								{@const svcColor = svcColors[r.service.toLowerCase()] ?? '#71717a'}
+								<tr
+									style="border-bottom: 1px solid var(--color-border);"
+									onmouseenter={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--color-surface)'}
+									onmouseleave={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = ''}
+								>
+									<td class="px-4 py-3">
+										<span class="inline-block rounded px-2 py-0.5 text-xs font-medium font-mono"
+											style="background-color: {svcColor}22; color: {svcColor};">
+											{r.service}
+										</span>
+									</td>
+									<td class="px-4 py-3">
+										{#if r.name}
+											<span class="font-medium">{r.name}</span>
+											<span class="block font-mono text-xs" style="color: var(--color-muted);">{r.resource}</span>
+										{:else}
+											<span class="font-mono text-xs">{r.resource}</span>
+										{/if}
+									</td>
+									<td class="px-4 py-3 font-mono text-xs max-w-xs truncate" style="color: var(--color-muted);" title={r.arn}>{r.arn}</td>
+									<td class="px-4 py-3">
+										<div class="flex flex-wrap gap-1">
+											{#each r.tags as tag}
+												<span class="rounded px-1.5 py-0.5 text-xs font-mono" style="background-color: var(--color-border);">{tag.Key}: <span style="color: var(--color-muted);">{tag.Value}</span></span>
+											{/each}
+										</div>
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			</div>
+		{:else if tagSearched && !tagLoading && !tagError}
+			<div class="rounded-lg border p-10 text-center" style="border-color: var(--color-border); border-style: dashed;">
+				<p class="text-sm font-medium mb-1">No resources found</p>
+				<p class="text-xs" style="color: var(--color-muted);">No resources in {region} have the tag <code class="font-mono">{tagKey}{tagValue ? '=' + tagValue : ''}</code></p>
+			</div>
+		{:else if !tagSearched}
+			<div class="rounded-lg border p-10 text-center" style="border-color: var(--color-border); border-style: dashed;">
+				<svg class="w-8 h-8 mx-auto mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--color-muted);">
+					<path d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 0 1 0 2.828l-7 7a2 2 0 0 1-2.828 0l-7-7A2 2 0 0 1 3 12V7a4 4 0 0 1 4-4z"/>
+				</svg>
+				<p class="text-sm font-medium mb-1">Search resources by tag</p>
+				<p class="text-xs" style="color: var(--color-muted);">Enter a tag key (and optional value) to find all AWS resources in {region} with that tag.</p>
+			</div>
+		{/if}
+	</div>
 {/if}
 
 <!-- Bottom spacer so content isn't hidden behind the log tray -->

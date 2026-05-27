@@ -16,6 +16,7 @@ from sparkle.aws import (
     AWSError, Credentials, CredentialsError,
     InstanceEvent, InstanceRecord,
     fetch_s3_events, list_events, list_instances, list_regions,
+    list_volumes, search_resources_by_tag,
     reboot_instance, set_instance_tags, start_instance, stop_instance, terminate_instance,
 )
 
@@ -316,6 +317,42 @@ async def get_s3_events(
     except AWSError as e:
         raise HTTPException(status_code=502, detail=f"AWS error: {e}")
     return [EventResponse.from_record(e) for e in evts]
+
+
+@app.get("/api/tag-search")
+async def tag_search_endpoint(
+    key: str = Query(..., description="Tag key to search for"),
+    value: str | None = Query(default=None, description="Tag value (omit to match any value)"),
+    region: str = Query(..., description="AWS region"),
+    x_aws_cred_source: str | None = Header(default=None),
+    x_aws_access_key_id: str | None = Header(default=None),
+    x_aws_secret_access_key: str | None = Header(default=None),
+    x_aws_session_token: str | None = Header(default=None),
+):
+    try:
+        creds = _resolve_creds(x_aws_cred_source, x_aws_access_key_id, x_aws_secret_access_key, x_aws_session_token)
+        return search_resources_by_tag(key, value, region, creds)
+    except CredentialsError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except AWSError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/volumes")
+async def get_volumes_endpoint(
+    region: str = Query(..., description="AWS region"),
+    x_aws_cred_source: str | None = Header(default=None),
+    x_aws_access_key_id: str | None = Header(default=None),
+    x_aws_secret_access_key: str | None = Header(default=None),
+    x_aws_session_token: str | None = Header(default=None),
+):
+    try:
+        creds = _resolve_creds(x_aws_cred_source, x_aws_access_key_id, x_aws_secret_access_key, x_aws_session_token)
+        return list_volumes(region, creds)
+    except CredentialsError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except AWSError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/api/config")
