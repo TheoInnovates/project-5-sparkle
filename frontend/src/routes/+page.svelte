@@ -296,9 +296,39 @@
 			else if (sortCol === 'launch') { av = a.launch_time ?? ''; bv = b.launch_time ?? ''; }
 			else if (sortCol === 'started') { av = a.first_started ?? ''; bv = b.first_started ?? ''; }
 			else if (sortCol === 'username') { av = a.username ?? ''; bv = b.username ?? ''; }
+			else if (sortCol === 'stopped') { av = a.last_stopped ?? ''; bv = b.last_stopped ?? ''; }
 			return av.localeCompare(bv) * dir;
 		})
 	);
+
+	// ── Column visibility ─────────────────────────────────────────────────────
+	const ALL_COLUMNS = [
+		{ key: 'name',       label: 'Name',         sort: 'name',     evt: false },
+		{ key: 'id',         label: 'Instance ID',  sort: 'id',       evt: false },
+		{ key: 'state',      label: 'State',        sort: 'state',    evt: false },
+		{ key: 'type',       label: 'Type',         sort: 'type',     evt: false },
+		{ key: 'az',         label: 'AZ',           sort: 'az',       evt: false },
+		{ key: 'launch',     label: 'Launch Time',  sort: 'launch',   evt: false },
+		{ key: 'started',    label: 'First Started',sort: 'started',  evt: true  },
+		{ key: 'username',   label: 'Username',     sort: 'username', evt: true  },
+		{ key: 'stopped',    label: 'Last Stopped', sort: 'stopped',  evt: true  },
+		{ key: 'private_ip', label: 'Private IP',   sort: null,       evt: false },
+		{ key: 'public_ip',  label: 'Public IP',    sort: null,       evt: false },
+		{ key: 'vpc',        label: 'VPC',          sort: null,       evt: false },
+		{ key: 'iam',        label: 'IAM Profile',  sort: null,       evt: false },
+	];
+
+	let visibleCols = $state(new Set(['name','id','state','type','az','launch','started','username','stopped']));
+	let colPickerOpen = $state(false);
+
+	function toggleCol(key: string) {
+		const next = new Set(visibleCols);
+		if (next.has(key)) { if (next.size > 1) next.delete(key); }
+		else next.add(key);
+		visibleCols = next;
+	}
+
+	const tableColspan = $derived(visibleCols.size + 1);
 
 	// ── Copy to clipboard ─────────────────────────────────────────────────────
 	let copiedValue = $state<string | null>(null);
@@ -968,6 +998,44 @@
 			<span style="color: var(--color-muted);">Auto-refresh (30s)</span>
 		</label>
 
+		<!-- Column picker -->
+		<div class="relative">
+			<button
+				onclick={() => colPickerOpen = !colPickerOpen}
+				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium border transition-colors"
+				style="border-color: {colPickerOpen ? 'var(--color-accent)' : 'var(--color-border)'}; color: var(--color-text);"
+				title="Show/hide columns"
+			>
+				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="18" rx="1"/>
+				</svg>
+				Columns
+				<svg class="w-3 h-3 transition-transform" style="transform: rotate({colPickerOpen ? '180deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+			</button>
+			{#if colPickerOpen}
+				<div class="fixed inset-0 z-40" role="presentation" onclick={() => colPickerOpen = false}></div>
+				<div class="absolute left-0 top-full mt-1 z-50 rounded border shadow-xl py-1 min-w-44"
+					style="background-color: var(--color-surface); border-color: var(--color-border);">
+					{#each ALL_COLUMNS as col}
+						<label class="flex items-center gap-2.5 px-3 py-1.5 text-xs cursor-pointer select-none hover:opacity-80">
+							<input
+								type="checkbox"
+								checked={visibleCols.has(col.key)}
+								onchange={() => toggleCol(col.key)}
+								class="rounded"
+							/>
+							{col.label}
+						</label>
+					{/each}
+					<div class="border-t mt-1 pt-1 px-3 pb-1" style="border-color: var(--color-border);">
+						<button
+							onclick={() => { visibleCols = new Set(['name','id','state','type','az','launch','started','username','stopped']); }}
+							class="text-xs" style="color: var(--color-muted);">Reset to defaults</button>
+					</div>
+				</div>
+			{/if}
+		</div>
+
 		{#if sortedInstances.length > 0}
 			<button
 				onclick={exportInstancesCSV}
@@ -1274,17 +1342,17 @@
 				<thead>
 					<tr style="background-color: var(--color-surface); border-bottom: 1px solid var(--color-border);">
 						<th class="px-2 py-3 w-8"></th>
-						{#each [['name','Name'],['id','Instance ID'],['state','State'],['type','Type'],['az','AZ'],['launch','Launch Time'],['started','First Started'],['username','Username']] as [col, label]}
+						{#each ALL_COLUMNS.filter(c => visibleCols.has(c.key)) as col}
 							<th
-								class="text-left px-4 py-3 font-semibold cursor-pointer select-none whitespace-nowrap"
+								class="text-left px-4 py-3 font-semibold whitespace-nowrap {col.sort ? 'cursor-pointer select-none' : ''}"
 								style="color: var(--color-muted);"
-								onclick={() => toggleSort(col)}
+								onclick={() => col.sort && toggleSort(col.sort)}
 							>
-								{label}
-								{#if col === 'started' || col === 'username'}
+								{col.label}
+								{#if col.evt}
 									{#if eventsLoading}<svg class="inline w-3 h-3 animate-spin ml-1" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>{/if}
 								{/if}
-								{#if sortCol === col}
+								{#if col.sort && sortCol === col.sort}
 									<svg class="inline w-3 h-3 ml-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
 										{#if sortDir === 'asc'}<polyline points="18 15 12 9 6 15"/>{:else}<polyline points="6 9 12 15 18 9"/>{/if}
 									</svg>
@@ -1298,18 +1366,18 @@
 						{#each { length: 5 } as _}
 							<tr style="border-bottom: 1px solid var(--color-border);">
 								<td class="px-2 py-3 w-8"></td>
-								{#each { length: 8 } as _}
+								{#each { length: visibleCols.size } as _}
 									<td class="px-4 py-3"><div class="h-4 rounded animate-pulse w-24" style="background-color: var(--color-border);"></div></td>
 								{/each}
 							</tr>
 						{/each}
 					{:else if instances.length === 0 && !error}
 						<tr>
-							<td colspan="9" class="px-4 py-12 text-center" style="color: var(--color-muted);">No instances found in {region}</td>
+							<td colspan={tableColspan} class="px-4 py-12 text-center" style="color: var(--color-muted);">No instances found in {region}</td>
 						</tr>
 					{:else if sortedInstances.length === 0 && hasActiveFilters}
 						<tr>
-							<td colspan="9" class="px-4 py-12 text-center" style="color: var(--color-muted);">
+							<td colspan={tableColspan} class="px-4 py-12 text-center" style="color: var(--color-muted);">
 								No instances match the current filters.
 								<button onclick={clearFilters} class="ml-2 underline" style="color: var(--color-accent);">Clear filters</button>
 							</td>
@@ -1328,7 +1396,8 @@
 								<td class="px-2 py-3 w-8 text-center">
 									<svg class="w-3.5 h-3.5 inline transition-transform" style="color: var(--color-muted); transform: rotate({isExpanded ? '90deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
 								</td>
-								<td class="px-4 py-3 font-medium">{inst.name}</td>
+								{#if visibleCols.has('name')}<td class="px-4 py-3 font-medium">{inst.name}</td>{/if}
+								{#if visibleCols.has('id')}
 								<td class="px-4 py-3 font-mono text-xs group/iid" style="color: var(--color-muted);">
 									{inst.instance_id}
 									<button
@@ -1344,6 +1413,8 @@
 										{/if}
 									</button>
 								</td>
+								{/if}
+								{#if visibleCols.has('state')}
 								<td class="px-4 py-3">
 									<span class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium"
 										style="background-color: {stateColor(inst.state)}22; color: {stateColor(inst.state)};">
@@ -1351,9 +1422,11 @@
 										{inst.state}
 									</span>
 								</td>
-								<td class="px-4 py-3" style="color: var(--color-muted);">{inst.instance_type}</td>
-								<td class="px-4 py-3" style="color: var(--color-muted);">{inst.availability_zone}</td>
-								<td class="px-4 py-3 whitespace-nowrap" title={inst.launch_time}>{fmtDate(inst.launch_time)}</td>
+								{/if}
+								{#if visibleCols.has('type')}<td class="px-4 py-3" style="color: var(--color-muted);">{inst.instance_type}</td>{/if}
+								{#if visibleCols.has('az')}<td class="px-4 py-3" style="color: var(--color-muted);">{inst.availability_zone}</td>{/if}
+								{#if visibleCols.has('launch')}<td class="px-4 py-3 whitespace-nowrap" title={inst.launch_time}>{fmtDate(inst.launch_time)}</td>{/if}
+								{#if visibleCols.has('started')}
 								<td class="px-4 py-3 whitespace-nowrap">
 									{#if eventsLoading && !inst.first_started}
 										<span style="color: var(--color-muted);">···</span>
@@ -1363,6 +1436,8 @@
 										<span title="No RunInstances event found — instance may pre-date the 90-day CloudTrail retention window" style="color: var(--color-muted);" class="cursor-help">—</span>
 									{/if}
 								</td>
+								{/if}
+								{#if visibleCols.has('username')}
 								<td class="px-4 py-3">
 									{#if eventsLoading && !inst.username}
 										<span style="color: var(--color-muted);">···</span>
@@ -1372,11 +1447,27 @@
 										<span title="No RunInstances event found — instance may pre-date the 90-day CloudTrail retention window" style="color: var(--color-muted);" class="cursor-help">—</span>
 									{/if}
 								</td>
+								{/if}
+								{#if visibleCols.has('stopped')}
+								<td class="px-4 py-3 whitespace-nowrap">
+									{#if eventsLoading && !inst.last_stopped}
+										<span style="color: var(--color-muted);">···</span>
+									{:else if inst.last_stopped}
+										<span title={inst.last_stopped}>{fmtDate(inst.last_stopped)}</span>
+									{:else}
+										<span title="No StopInstances event found in CloudTrail window" style="color: var(--color-muted);" class="cursor-help">—</span>
+									{/if}
+								</td>
+								{/if}
+								{#if visibleCols.has('private_ip')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.private_ip ?? '—'}</td>{/if}
+								{#if visibleCols.has('public_ip')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.public_ip ?? '—'}</td>{/if}
+								{#if visibleCols.has('vpc')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.vpc_id ?? '—'}</td>{/if}
+								{#if visibleCols.has('iam')}<td class="px-4 py-3 font-mono text-xs truncate max-w-xs" style="color: var(--color-muted);" title={inst.iam_profile ?? ''}>{inst.iam_profile ? shortUsername(inst.iam_profile) : '—'}</td>{/if}
 							</tr>
 
 							{#if isExpanded}
 								<tr style="border-bottom: 1px solid var(--color-border); background-color: var(--color-surface);">
-									<td colspan="9" class="px-4 pb-4 pt-3">
+									<td colspan={tableColspan} class="px-4 pb-4 pt-3">
 
 										<!-- Network + instance metadata grid -->
 										<div class="grid grid-cols-2 gap-4 mb-4 text-xs">
