@@ -7,6 +7,7 @@
 	const stored = loadCredConfig();
 	let open = $state(stored.source === 'local' && !envConfigured ? false : false);
 	let source = $state<CredSource>(stored.source);
+	let region = $state(stored.region ?? '');
 	let accessKeyId = $state(stored.accessKeyId ?? '');
 	let secretAccessKey = $state(stored.secretAccessKey ?? '');
 	let sessionToken = $state(stored.sessionToken ?? '');
@@ -27,6 +28,7 @@
 
 	function handleSave() {
 		const config: CredConfig = { source };
+		if (region.trim()) config.region = region.trim();
 		if (source === 'manual') {
 			if (!accessKeyId.trim() || !secretAccessKey.trim()) return;
 			config.accessKeyId = accessKeyId.trim();
@@ -41,6 +43,7 @@
 	function handleClear() {
 		clearCredConfig();
 		source = 'local';
+		region = '';
 		accessKeyId = '';
 		secretAccessKey = '';
 		sessionToken = '';
@@ -109,6 +112,20 @@
 						</div>
 					</label>
 				{/each}
+			</div>
+
+			<!-- Region preference — always visible -->
+			<div class="border-t pt-3 mb-4" style="border-color: var(--color-border);">
+				<label class="block">
+					<span class="text-xs mb-1 block" style="color: var(--color-muted);">Default Region</span>
+					<input
+						type="text"
+						bind:value={region}
+						placeholder="us-east-1"
+						class="w-full rounded px-2.5 py-1.5 text-sm border font-mono"
+						style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);"
+					/>
+				</label>
 			</div>
 
 			<!-- Manual fields — only shown when manual is selected -->

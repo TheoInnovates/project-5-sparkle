@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { getConfig, listEvents, listInstances, listRegions, loadCredConfig } from '$lib/api';
+	import { fetchS3Events, getConfig, listEvents, listInstances, listRegions, loadCredConfig, rebootInstance, startInstance, stopInstance, terminateInstance, updateTags } from '$lib/api';
 	import type { InstanceEvent, InstanceRecord } from '$lib/types';
 
 	let region = $state('us-east-1');
@@ -13,13 +13,112 @@
 	let lastRefreshed = $state<Date | null>(null);
 	let autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
-	let activeTab = $state<'instances' | 'timeline'>('instances');
+	let activeTab = $state<'instances' | 'timeline' | 'lifetime'>('instances');
 	let events = $state<InstanceEvent[]>([]);
 	let eventsLoading = $state(false);
 	let eventsError = $state<string | null>(null);
 	let eventsLoaded = $state(false);
 
-	// File import
+	// ── Instance management ───────────────────────────────────────────────────
+	let expandedId = $state<string | null>(null);
+	let actionLoading = $state<string | null>(null);
+	let actionError = $state<Record<string, string>>({});
+	let confirmTerminateId = $state<string | null>(null);
+	let confirmInput = $state('');
+	let editingTagsId = $state<string | null>(null);
+	let draftTags = $state<{ Key: string; Value: string }[]>([]);
+
+	async function doAction(instanceId: string, action: 'start' | 'stop' | 'terminate' | 'reboot') {
+		actionLoading = instanceId;
+		actionError = { ...actionError, [instanceId]: '' };
+		const t0 = Date.now();
+		addLog('info', 'action', `${action} ${instanceId}…`);
+		try {
+			if (action === 'reboot') {
+				await rebootInstance(region, instanceId);
+				addLog('info', 'action', `${action} ${instanceId}: ok`, Date.now() - t0);
+			} else {
+				const fn = action === 'start' ? startInstance : action === 'stop' ? stopInstance : terminateInstance;
+				const result = await fn(region, instanceId);
+				addLog('info', 'action', `${action} ${instanceId}: ${result.previous_state} → ${result.current_state}`, Date.now() - t0);
+			}
+			confirmTerminateId = null;
+			confirmInput = '';
+			await loadInstances(true);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			actionError = { ...actionError, [instanceId]: msg };
+			addLog('error', 'action', `${action} ${instanceId}: ${msg}`, Date.now() - t0);
+		} finally {
+			actionLoading = null;
+		}
+	}
+
+	function startTagEdit(inst: { instance_id: string; tags: { Key: string; Value: string }[] | null }) {
+		editingTagsId = inst.instance_id;
+		draftTags = inst.tags ? inst.tags.map(t => ({ ...t })) : [];
+	}
+
+	async function saveTagEdit(instanceId: string, originalTags: { Key: string; Value: string }[] | null) {
+		actionLoading = instanceId;
+		const t0 = Date.now();
+		const origKeys = new Set((originalTags ?? []).map(t => t.Key));
+		const draftKeys = new Set(draftTags.map(t => t.Key));
+		const deleteKeys = [...origKeys].filter(k => !draftKeys.has(k));
+		addLog('info', 'tags', `Updating tags for ${instanceId}…`);
+		try {
+			await updateTags(region, instanceId, draftTags, deleteKeys);
+			addLog('info', 'tags', `Tags updated for ${instanceId}`, Date.now() - t0);
+			editingTagsId = null;
+			await loadInstances(true);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			actionError = { ...actionError, [instanceId]: msg };
+			addLog('error', 'tags', `Tag update ${instanceId}: ${msg}`, Date.now() - t0);
+		} finally {
+			actionLoading = null;
+		}
+	}
+
+	// ── Log tray ─────────────────────────────────────────────────────────────
+
+	interface LogEntry {
+		id: number;
+		time: Date;
+		level: 'info' | 'warn' | 'error';
+		source: string;
+		message: string;
+		duration?: number;
+	}
+
+	let logEntries = $state<LogEntry[]>([]);
+	let logsOpen = $state(false);
+	let logSeq = 0;
+	let logScrollEl = $state<HTMLDivElement | null>(null);
+
+	const errorCount = $derived(logEntries.filter(e => e.level === 'error').length);
+	const latestEntry = $derived(logEntries.at(-1));
+
+	function addLog(level: LogEntry['level'], source: string, message: string, duration?: number) {
+		logEntries = [...logEntries.slice(-199), { id: logSeq++, time: new Date(), level, source, message, duration }];
+	}
+
+	$effect(() => {
+		if (logsOpen && logScrollEl && logEntries.length > 0) {
+			logScrollEl.scrollTop = logScrollEl.scrollHeight;
+		}
+	});
+
+	function fmtTime(d: Date): string {
+		return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+	}
+
+	function fmtDuration(ms: number): string {
+		return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+	}
+
+	// ── File import ───────────────────────────────────────────────────────────
+
 	let fileInputEl = $state<HTMLInputElement | null>(null);
 	let importedEvents = $state<InstanceEvent[]>([]);
 	let importFileName = $state<string | null>(null);
@@ -70,16 +169,185 @@
 		return `${m}m ago`;
 	}
 
+	function shortUsername(raw: string): string {
+		// arn:aws:iam::123456789:user/john.doe → john.doe
+		// arn:aws:sts::123456789:assumed-role/RoleName/session → RoleName/session
+		const m = raw.match(/(?:user|assumed-role)\/(.+)$/);
+		return m ? m[1] : raw;
+	}
+
 	const instanceNameMap = $derived(
 		Object.fromEntries(instances.map(i => [i.instance_id, i.name]))
 	);
 
-	// Active event list — file import overrides live API data
+	// Enrich instances with first_started/username from events (avoids per-instance CloudTrail calls)
+	const firstRunMap = $derived(
+		events.reduce((acc: Record<string, InstanceEvent>, e) => {
+			if (e.event_name !== 'RunInstances') return acc;
+			if (!acc[e.instance_id] || e.event_time < acc[e.instance_id].event_time) {
+				acc[e.instance_id] = e;
+			}
+			return acc;
+		}, {})
+	);
+
+	const lastStartedMap = $derived(
+		events.reduce((acc: Record<string, InstanceEvent>, e) => {
+			if (e.event_name !== 'StartInstances') return acc;
+			if (!acc[e.instance_id] || e.event_time > acc[e.instance_id].event_time) acc[e.instance_id] = e;
+			return acc;
+		}, {})
+	);
+
+	const lastStoppedMap = $derived(
+		events.reduce((acc: Record<string, InstanceEvent>, e) => {
+			if (e.event_name !== 'StopInstances') return acc;
+			if (!acc[e.instance_id] || e.event_time > acc[e.instance_id].event_time) acc[e.instance_id] = e;
+			return acc;
+		}, {})
+	);
+
+	const lastTerminatedMap = $derived(
+		events.reduce((acc: Record<string, InstanceEvent>, e) => {
+			if (e.event_name !== 'TerminateInstances') return acc;
+			if (!acc[e.instance_id] || e.event_time > acc[e.instance_id].event_time) acc[e.instance_id] = e;
+			return acc;
+		}, {})
+	);
+
+	const enrichedInstances = $derived(
+		instances.map(inst => ({
+			...inst,
+			first_started:      firstRunMap[inst.instance_id]?.event_time ?? null,
+			username:           firstRunMap[inst.instance_id]?.username ?? null,
+			last_started:       lastStartedMap[inst.instance_id]?.event_time ?? null,
+			last_started_by:    lastStartedMap[inst.instance_id]?.username ?? null,
+			last_stopped:       lastStoppedMap[inst.instance_id]?.event_time ?? null,
+			last_stopped_by:    lastStoppedMap[inst.instance_id]?.username ?? null,
+			last_terminated:    lastTerminatedMap[inst.instance_id]?.event_time ?? null,
+			last_terminated_by: lastTerminatedMap[inst.instance_id]?.username ?? null,
+		}))
+	);
+
+	// ── Search & Filter ──────────────────────────────────────────────────────────
+	let searchText = $state('');
+	let filterStates = $state<Set<string>>(new Set());
+	let filterType = $state('');
+	let filterAZ = $state('');
+
+	const distinctTypes = $derived([...new Set(enrichedInstances.map(i => i.instance_type))].sort());
+	const distinctAZs = $derived([...new Set(enrichedInstances.map(i => i.availability_zone))].sort());
+
+	const filteredInstances = $derived(
+		enrichedInstances.filter(inst => {
+			if (searchText) {
+				const q = searchText.toLowerCase();
+				if (!inst.name.toLowerCase().includes(q) && !inst.instance_id.toLowerCase().includes(q)) return false;
+			}
+			if (filterStates.size > 0 && !filterStates.has(inst.state)) return false;
+			if (filterType && inst.instance_type !== filterType) return false;
+			if (filterAZ && inst.availability_zone !== filterAZ) return false;
+			return true;
+		})
+	);
+
+	const stateCounts = $derived({
+		running: enrichedInstances.filter(i => i.state === 'running').length,
+		stopped: enrichedInstances.filter(i => i.state === 'stopped').length,
+		terminated: enrichedInstances.filter(i => i.state === 'terminated').length,
+		other: enrichedInstances.filter(i => !['running','stopped','terminated'].includes(i.state)).length,
+	});
+
+	function toggleStateFilter(s: string) {
+		const next = new Set(filterStates);
+		next.has(s) ? next.delete(s) : next.add(s);
+		filterStates = next;
+	}
+
+	function clearFilters() {
+		searchText = '';
+		filterStates = new Set();
+		filterType = '';
+		filterAZ = '';
+	}
+
+	const hasActiveFilters = $derived(
+		searchText !== '' || filterStates.size > 0 || filterType !== '' || filterAZ !== ''
+	);
+
+	// ── Column Sorting ────────────────────────────────────────────────────────
+	let sortCol = $state('name');
+	let sortDir = $state<'asc' | 'desc'>('asc');
+
+	function toggleSort(col: string) {
+		if (sortCol === col) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+		else { sortCol = col; sortDir = 'asc'; }
+	}
+
+	const sortedInstances = $derived(
+		[...filteredInstances].sort((a, b) => {
+			const dir = sortDir === 'asc' ? 1 : -1;
+			let av = '', bv = '';
+			if (sortCol === 'name') { av = a.name; bv = b.name; }
+			else if (sortCol === 'id') { av = a.instance_id; bv = b.instance_id; }
+			else if (sortCol === 'state') { av = a.state; bv = b.state; }
+			else if (sortCol === 'type') { av = a.instance_type; bv = b.instance_type; }
+			else if (sortCol === 'az') { av = a.availability_zone; bv = b.availability_zone; }
+			else if (sortCol === 'launch') { av = a.launch_time ?? ''; bv = b.launch_time ?? ''; }
+			else if (sortCol === 'started') { av = a.first_started ?? ''; bv = b.first_started ?? ''; }
+			else if (sortCol === 'username') { av = a.username ?? ''; bv = b.username ?? ''; }
+			return av.localeCompare(bv) * dir;
+		})
+	);
+
+	// ── Copy to clipboard ─────────────────────────────────────────────────────
+	let copiedValue = $state<string | null>(null);
+
+	async function copyToClipboard(text: string, e: MouseEvent) {
+		e.stopPropagation();
+		await navigator.clipboard.writeText(text);
+		copiedValue = text;
+		setTimeout(() => { if (copiedValue === text) copiedValue = null; }, 1500);
+	}
+
+	// ── Active event list — file import overrides live API data
 	const activeEvents = $derived(importSource === 'file' ? importedEvents : events);
+
+	// ── Timeline Filters ──────────────────────────────────────────────────────
+	let tlFilterFrom = $state('');
+	let tlFilterTo = $state('');
+	let tlFilterEvents = $state<Set<string>>(new Set());
+	let tlFilterUser = $state('');
+	let tlFilterInstanceId = $state('');
+
+	function toggleTlEventFilter(name: string) {
+		const next = new Set(tlFilterEvents);
+		next.has(name) ? next.delete(name) : next.add(name);
+		tlFilterEvents = next;
+	}
+
+	function jumpToTimeline(instanceId: string) {
+		tlFilterInstanceId = instanceId;
+		activeTab = 'timeline';
+	}
+
+	const filteredActiveEvents = $derived(
+		activeEvents.filter(e => {
+			if (tlFilterInstanceId && e.instance_id !== tlFilterInstanceId) return false;
+			if (tlFilterFrom && e.event_time < tlFilterFrom) return false;
+			if (tlFilterTo && e.event_time > tlFilterTo + 'T23:59:59Z') return false;
+			if (tlFilterEvents.size > 0 && !tlFilterEvents.has(e.event_name)) return false;
+			if (tlFilterUser) {
+				const user = (e.username ?? '').toLowerCase();
+				if (!user.includes(tlFilterUser.toLowerCase())) return false;
+			}
+			return true;
+		})
+	);
 
 	const groupedEvents = $derived(
 		Object.entries(
-			activeEvents.reduce((acc: Record<string, InstanceEvent[]>, e) => {
+			filteredActiveEvents.reduce((acc: Record<string, InstanceEvent[]>, e) => {
 				(acc[e.instance_id] ??= []).push(e);
 				return acc;
 			}, {})
@@ -87,6 +355,62 @@
 			(instanceNameMap[a] ?? a).localeCompare(instanceNameMap[b] ?? b)
 		)
 	);
+
+	// ── S3 archive query ─────────────────────────────────────────────────────
+
+	let s3PanelOpen = $state(false);
+	let s3Bucket = $state('');
+	let s3BucketRegion = $state('');
+	let s3Prefix = $state('');
+	let s3StartDate = $state('');
+	let s3EndDate = $state('');
+	let s3Loading = $state(false);
+	let s3Error = $state<string | null>(null);
+
+	function defaultStartDate(): string {
+		const d = new Date();
+		d.setFullYear(d.getFullYear() - 1);
+		return d.toISOString().split('T')[0];
+	}
+	function defaultEndDate(): string {
+		return new Date().toISOString().split('T')[0];
+	}
+
+	async function fetchS3Archive() {
+		if (!s3Bucket.trim()) return;
+		s3Loading = true;
+		s3Error = null;
+		const t0 = Date.now();
+		const start = s3StartDate || defaultStartDate();
+		const end = s3EndDate || defaultEndDate();
+		addLog('info', 's3', `Fetching CloudTrail logs from s3://${s3Bucket.trim()} (${start} → ${end})…`);
+		try {
+			const s3Events = await fetchS3Events(region, {
+				bucket: s3Bucket.trim(),
+				bucketRegion: s3BucketRegion.trim() || undefined,
+				prefix: s3Prefix.trim() || undefined,
+				startDate: start,
+				endDate: end,
+			});
+			// Merge with existing events, deduplicate by (event_time, event_name, instance_id)
+			const existing = importSource === 'file' ? importedEvents : events;
+			const seen = new Set(existing.map(e => `${e.event_time}|${e.event_name}|${e.instance_id}`));
+			const newOnly = s3Events.filter(e => !seen.has(`${e.event_time}|${e.event_name}|${e.instance_id}`));
+			const merged = [...existing, ...newOnly].sort((a, b) => a.event_time.localeCompare(b.event_time));
+			importedEvents = merged;
+			importSource = 'file';
+			importFileName = `S3 archive (${s3Events.length} new events)`;
+			activeTab = 'timeline';
+			s3PanelOpen = false;
+			addLog('info', 's3', `Fetched ${s3Events.length} events (${newOnly.length} new after dedup) from S3`, Date.now() - t0);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			s3Error = msg;
+			addLog('error', 's3', msg, Date.now() - t0);
+		} finally {
+			s3Loading = false;
+		}
+	}
 
 	// ── CloudTrail file parsing ──────────────────────────────────────────────
 
@@ -144,7 +468,9 @@
 		const file = (e.target as HTMLInputElement).files?.[0];
 		if (!file) return;
 		importError = null;
+		addLog('info', 'import', `Reading ${file.name} (${(file.size / 1024).toFixed(1)} KB)…`);
 		const reader = new FileReader();
+		const t0 = Date.now();
 		reader.onload = () => {
 			try {
 				const parsed = parseCloudTrailJson(reader.result as string);
@@ -152,9 +478,12 @@
 				importFileName = file.name;
 				importSource = 'file';
 				activeTab = 'timeline';
+				addLog('info', 'import', `Parsed ${parsed.length} events from ${file.name}`, Date.now() - t0);
 			} catch (err) {
-				importError = err instanceof Error ? err.message : String(err);
+				const msg = err instanceof Error ? err.message : String(err);
+				importError = msg;
 				importFileName = null;
+				addLog('error', 'import', msg, Date.now() - t0);
 			}
 			// Reset input so the same file can be re-selected
 			if (fileInputEl) fileInputEl.value = '';
@@ -179,11 +508,18 @@
 			refreshing = true;
 		}
 		error = null;
+		const t0 = Date.now();
+		addLog('info', 'instances', `Fetching instances for ${region}…`);
 		try {
 			instances = await listInstances(region);
 			lastRefreshed = new Date();
+			addLog('info', 'instances', `Loaded ${instances.length} instance${instances.length !== 1 ? 's' : ''} from ${region}`, Date.now() - t0);
+			// Auto-load CloudTrail events in background to enrich First Started / Username columns
+			if (!eventsLoaded && !eventsLoading && importSource === 'api') loadEventsData();
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			const msg = e instanceof Error ? e.message : String(e);
+			error = msg;
+			addLog('error', 'instances', msg, Date.now() - t0);
 		} finally {
 			loading = false;
 			refreshing = false;
@@ -193,11 +529,16 @@
 	async function loadEventsData() {
 		eventsLoading = true;
 		eventsError = null;
+		const t0 = Date.now();
+		addLog('info', 'events', `Fetching CloudTrail events for ${region}…`);
 		try {
 			events = await listEvents(region);
 			eventsLoaded = true;
+			addLog('info', 'events', `Loaded ${events.length} event${events.length !== 1 ? 's' : ''} from ${region}`, Date.now() - t0);
 		} catch (e) {
-			eventsError = e instanceof Error ? e.message : String(e);
+			const msg = e instanceof Error ? e.message : String(e);
+			eventsError = msg;
+			addLog('error', 'events', msg, Date.now() - t0);
 		} finally {
 			eventsLoading = false;
 		}
@@ -226,9 +567,9 @@
 		autoRefresh ? startAutoRefresh() : stopAutoRefresh();
 	}
 
-	async function switchTab(tab: 'instances' | 'timeline') {
+	async function switchTab(tab: 'instances' | 'timeline' | 'lifetime') {
 		activeTab = tab;
-		if (tab === 'timeline' && importSource === 'api' && !eventsLoaded && !eventsLoading) {
+		if ((tab === 'timeline' || tab === 'lifetime') && importSource === 'api' && !eventsLoaded && !eventsLoading) {
 			await loadEventsData();
 		}
 	}
@@ -239,6 +580,7 @@
 			region = stored.region;
 			if (!regions.includes(region)) regions = [region, ...regions];
 		}
+		addLog('info', 'credentials', `Credential source changed to ${stored.source}${stored.region ? ` · region ${stored.region}` : ''}`);
 		instances = [];
 		events = [];
 		eventsLoaded = false;
@@ -270,6 +612,22 @@
 		triggerDownload(new Blob([csv], { type: 'text/csv' }), `sparkle-timeline-${region}-${today()}.csv`);
 	}
 
+	function exportInstancesCSV() {
+		const headers = ['Name','Instance ID','State','Type','AZ','Launch Time','First Started','Username','Private IP','Public IP','VPC','Subnet','AMI','Key Pair','IAM Profile','Architecture','Tags'];
+		const rows: string[][] = [headers];
+		for (const i of sortedInstances) {
+			rows.push([
+				i.name, i.instance_id, i.state, i.instance_type, i.availability_zone,
+				i.launch_time, i.first_started ?? '', i.username ?? '',
+				i.private_ip ?? '', i.public_ip ?? '', i.vpc_id ?? '', i.subnet_id ?? '',
+				i.image_id ?? '', i.key_name ?? '', i.iam_profile ?? '', i.architecture ?? '',
+				(i.tags ?? []).map(t => `${t.Key}=${t.Value}`).join(';'),
+			]);
+		}
+		const csv = rows.map(r => r.map(c => `"${c.replace(/"/g, '""')}"`).join(',')).join('\n');
+		triggerDownload(new Blob([csv], { type: 'text/csv' }), `sparkle-instances-${region}-${today()}.csv`);
+	}
+
 	function triggerDownload(blob: Blob, filename: string) {
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
@@ -295,17 +653,156 @@
 		// Populate region dropdown and server-default region in the background
 		getConfig()
 			.then(cfg => { if (!stored.region) region = cfg.default_region; })
-			.catch(() => {});
+			.catch(e => addLog('warn', 'config', `Could not fetch server config: ${e instanceof Error ? e.message : e}`));
 
-		listRegions()
-			.then(regs => { regions = regs.includes(region) ? regs : [region, ...regs]; })
-			.catch(() => {});
+		listRegions(region)
+			.then(regs => {
+				regions = regs.includes(region) ? regs : [region, ...regs];
+				addLog('info', 'regions', `Loaded ${regs.length} regions`);
+			})
+			.catch(e => addLog('warn', 'regions', `Could not fetch region list: ${e instanceof Error ? e.message : e}`));
 	});
 
 	onDestroy(() => {
 		stopAutoRefresh();
 		window.removeEventListener('sparkle:credentials-saved', onCredentialsSaved);
 	});
+
+	// ── Gantt chart ───────────────────────────────────────────────────────────
+
+	const GANTT_ROW_H = 36;
+	const GANTT_BAR_H = 18;
+	const GANTT_HDR_H = 32;
+	const GANTT_MIN_W = 900;
+
+	interface GanttSegment { start: number; end: number; state: 'running' | 'stopped' | 'terminated'; dashed: boolean; }
+	interface GanttRow { instanceId: string; name: string; currentState: string; segments: GanttSegment[]; }
+	interface GanttTooltipData { x: number; y: number; row: GanttRow; seg: GanttSegment; }
+
+	let ganttZoomFrom = $state('');
+	let ganttZoomTo = $state('');
+	let ganttTooltip = $state<GanttTooltipData | null>(null);
+	let ganttScrollEl = $state<HTMLDivElement | null>(null);
+	let ganttScrollElWidth = $state(0);
+
+	$effect(() => {
+		const el = ganttScrollEl;
+		if (!el) return;
+		const obs = new ResizeObserver(() => { ganttScrollElWidth = el.clientWidth; });
+		obs.observe(el);
+		ganttScrollElWidth = el.clientWidth;
+		return () => obs.disconnect();
+	});
+
+	const ganttSvgWidth = $derived(Math.max(ganttScrollElWidth - 4, GANTT_MIN_W));
+
+	function computeGantt(
+		insts: Array<typeof enrichedInstances[0]>,
+		evts: InstanceEvent[]
+	): GanttRow[] {
+		const now = Date.now();
+		const byInst: Record<string, InstanceEvent[]> = {};
+		for (const e of evts) (byInst[e.instance_id] ??= []).push(e);
+		for (const k of Object.keys(byInst)) byInst[k].sort((a, b) => a.event_time.localeCompare(b.event_time));
+
+		const instMap = Object.fromEntries(insts.map(i => [i.instance_id, i]));
+		const allIds = new Set([...insts.map(i => i.instance_id), ...Object.keys(byInst)]);
+		const rows: GanttRow[] = [];
+
+		for (const id of allIds) {
+			const inst = instMap[id];
+			const events = byInst[id] ?? [];
+			const segs: GanttSegment[] = [];
+
+			if (events.length === 0) {
+				if (!inst) continue;
+				const start = new Date(inst.launch_time).getTime();
+				const st: GanttSegment['state'] = inst.state === 'running' ? 'running' : inst.state === 'terminated' ? 'terminated' : 'stopped';
+				const end = st === 'terminated' ? Math.min(start + 7200000, now) : now;
+				segs.push({ start, end, state: st, dashed: true });
+			} else {
+				let curState: GanttSegment['state'] | null = null;
+				let curStart = 0;
+				let dashed = false;
+
+				for (const evt of events) {
+					const t = new Date(evt.event_time).getTime();
+					const close = () => { if (curState) segs.push({ start: curStart, end: t, state: curState, dashed }); dashed = false; };
+
+					if (evt.event_name === 'RunInstances') {
+						close(); curState = 'running'; curStart = t;
+					} else if (evt.event_name === 'StopInstances') {
+						if (!curState) { curState = 'running'; curStart = t; dashed = true; }
+						close(); curState = 'stopped'; curStart = t;
+					} else if (evt.event_name === 'StartInstances') {
+						if (!curState) { curState = 'stopped'; curStart = t; dashed = true; }
+						close(); curState = 'running'; curStart = t;
+					} else if (evt.event_name === 'TerminateInstances') {
+						if (!curState) { curState = 'running'; curStart = t; dashed = true; }
+						close();
+						segs.push({ start: t, end: Math.min(t + 7200000, now), state: 'terminated', dashed: false });
+						curState = null;
+					}
+				}
+				if (curState && curState !== 'terminated') segs.push({ start: curStart, end: now, state: curState, dashed });
+			}
+
+			if (segs.length > 0) {
+				rows.push({ instanceId: id, name: inst?.name ?? id, currentState: inst?.state ?? 'terminated', segments: segs });
+			}
+		}
+		return rows.sort((a, b) => a.name.localeCompare(b.name));
+	}
+
+	const ganttRows = $derived(computeGantt(enrichedInstances, activeEvents));
+
+	const ganttFullRange = $derived.by(() => {
+		let min = Infinity, max = -Infinity;
+		for (const row of ganttRows) {
+			for (const s of row.segments) {
+				if (s.start < min) min = s.start;
+				if (s.end > max) max = s.end;
+			}
+		}
+		if (!isFinite(min)) { min = Date.now() - 86400000 * 90; max = Date.now(); }
+		return { min, max };
+	});
+
+	const ganttViewRange = $derived.by(() => {
+		const f = ganttFullRange;
+		const from = ganttZoomFrom ? new Date(ganttZoomFrom).getTime() : f.min;
+		const to = ganttZoomTo ? new Date(ganttZoomTo + 'T23:59:59Z').getTime() : f.max;
+		return { min: from, max: Math.max(to, from + 3600000) };
+	});
+
+	function ganttTicks(minMs: number, maxMs: number, width: number): Array<{ x: number; label: string }> {
+		const range = maxMs - minMs;
+		const targetTicks = Math.max(3, Math.floor(width / 110));
+		const rawInterval = range / targetTicks;
+		const STEPS = [3600e3, 21600e3, 86400e3, 7 * 86400e3, 30 * 86400e3, 90 * 86400e3, 365 * 86400e3];
+		const interval = STEPS.find(s => s >= rawInterval) ?? STEPS[STEPS.length - 1];
+		const ticks: Array<{ x: number; label: string }> = [];
+		const start = Math.ceil(minMs / interval) * interval;
+		for (let t = start; t <= maxMs; t += interval) {
+			const d = new Date(t);
+			const label = interval < 86400e3
+				? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
+				: interval < 30 * 86400e3
+					? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+					: d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+			ticks.push({ x: ((t - minMs) / (maxMs - minMs)) * width, label });
+		}
+		return ticks;
+	}
+
+	function fmtDuration2(ms: number): string {
+		const d = Math.floor(ms / 86400000);
+		const h = Math.floor((ms % 86400000) / 3600000);
+		const m = Math.floor((ms % 3600000) / 60000);
+		if (d > 0) return `${d}d ${h}h`;
+		if (h > 0) return `${h}h ${m}m`;
+		return `${m}m`;
+	}
 </script>
 
 <!-- Hidden file input -->
@@ -352,9 +849,27 @@
 			<span style="color: var(--color-muted);">Auto-refresh (30s)</span>
 		</label>
 
+		{#if sortedInstances.length > 0}
+			<button
+				onclick={exportInstancesCSV}
+				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium border transition-colors"
+				style="border-color: var(--color-border); color: var(--color-text);"
+				title="Export filtered instances as CSV"
+			>
+				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+				</svg>
+				Export CSV
+			</button>
+		{/if}
+
 		<span class="text-sm ml-auto" style="color: var(--color-muted);">
 			{#if !loading}
-				{instances.length} instance{instances.length !== 1 ? 's' : ''}
+				{#if hasActiveFilters}
+					{sortedInstances.length} of {instances.length} instance{instances.length !== 1 ? 's' : ''}
+				{:else}
+					{instances.length} instance{instances.length !== 1 ? 's' : ''}
+				{/if}
 				{#if lastRefreshed}· refreshed {relativeTime(lastRefreshed.toISOString())}{/if}
 			{/if}
 		</span>
@@ -371,6 +886,95 @@
 			</svg>
 			Load CloudTrail Logs
 		</button>
+
+		<!-- S3 archive query -->
+		<div class="relative">
+			<button
+				onclick={() => { s3PanelOpen = !s3PanelOpen; s3Error = null; }}
+				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium border transition-colors"
+				style="border-color: var(--color-border); color: var(--color-text);"
+				title="Query CloudTrail logs archived in S3 (beyond 90-day lookup limit)"
+			>
+				<svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+				</svg>
+				S3 Archive
+				<svg class="w-3 h-3 transition-transform" style="transform: rotate({s3PanelOpen ? '180deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+			</button>
+
+			{#if s3PanelOpen}
+				<div class="absolute left-0 top-full mt-1 z-50 rounded-lg border p-4 shadow-xl"
+					style="background-color: var(--color-surface); border-color: var(--color-border); width: 340px;">
+					<p class="text-xs font-semibold mb-3" style="color: var(--color-muted);">QUERY S3 CLOUDTRAIL ARCHIVE</p>
+					<p class="text-xs mb-3" style="color: var(--color-muted);">
+						Fetches logs beyond the 90-day <code>lookup_events</code> limit.
+						Path: <code>AWSLogs/&#123;account&#125;/CloudTrail/&#123;region&#125;/…</code>
+					</p>
+
+					<label class="block mb-2">
+						<span class="text-xs mb-1 block" style="color: var(--color-muted);">S3 Bucket <span style="color: #f87171;">*</span></span>
+						<input type="text" bind:value={s3Bucket} placeholder="my-cloudtrail-bucket"
+							class="w-full rounded px-2.5 py-1.5 text-sm border font-mono"
+							style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);" />
+					</label>
+
+					<label class="block mb-2">
+						<span class="text-xs mb-1 block" style="color: var(--color-muted);">Bucket Region <span class="opacity-50">(if different from {region})</span></span>
+						<input type="text" bind:value={s3BucketRegion} placeholder={region}
+							class="w-full rounded px-2.5 py-1.5 text-sm border font-mono"
+							style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);" />
+					</label>
+
+					<label class="block mb-2">
+						<span class="text-xs mb-1 block" style="color: var(--color-muted);">Prefix <span class="opacity-50">(optional — for org trails)</span></span>
+						<input type="text" bind:value={s3Prefix} placeholder="e.g. org-trail/"
+							class="w-full rounded px-2.5 py-1.5 text-sm border font-mono"
+							style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);" />
+					</label>
+
+					<div class="flex gap-2 mb-3">
+						<label class="flex-1">
+							<span class="text-xs mb-1 block" style="color: var(--color-muted);">From</span>
+							<input type="date" bind:value={s3StartDate} placeholder={defaultStartDate()}
+								class="w-full rounded px-2.5 py-1.5 text-sm border"
+								style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);" />
+						</label>
+						<label class="flex-1">
+							<span class="text-xs mb-1 block" style="color: var(--color-muted);">To</span>
+							<input type="date" bind:value={s3EndDate} placeholder={defaultEndDate()}
+								class="w-full rounded px-2.5 py-1.5 text-sm border"
+								style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);" />
+						</label>
+					</div>
+
+					{#if s3Error}
+						<p class="text-xs mb-3 rounded px-2 py-1.5" style="background-color: #1f0a0a; color: #fca5a5;">{s3Error}</p>
+					{/if}
+
+					<div class="flex gap-2">
+						<button
+							onclick={fetchS3Archive}
+							disabled={s3Loading || !s3Bucket.trim()}
+							class="flex-1 flex items-center justify-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-40"
+							style="background-color: var(--color-accent); color: white;"
+						>
+							{#if s3Loading}
+								<svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+								Fetching…
+							{:else}
+								Fetch Events
+							{/if}
+						</button>
+						<button onclick={() => s3PanelOpen = false}
+							class="rounded px-3 py-1.5 text-sm border transition-colors"
+							style="border-color: var(--color-border); color: var(--color-muted);">
+							Cancel
+						</button>
+					</div>
+				</div>
+				<div class="fixed inset-0 z-40" role="presentation" onclick={() => s3PanelOpen = false}></div>
+			{/if}
+		</div>
 
 		{#if importSource === 'file'}
 			<!-- Imported file badge -->
@@ -425,7 +1029,7 @@
 
 		<span class="text-sm ml-auto" style="color: var(--color-muted);">
 			{#if activeEvents.length > 0}
-				{activeEvents.length} event{activeEvents.length !== 1 ? 's' : ''} across {groupedEvents.length} instance{groupedEvents.length !== 1 ? 's' : ''}
+				{filteredActiveEvents.length}{filteredActiveEvents.length !== activeEvents.length ? ` of ${activeEvents.length}` : ''} event{filteredActiveEvents.length !== 1 ? 's' : ''} across {groupedEvents.length} instance{groupedEvents.length !== 1 ? 's' : ''}
 				{#if importSource === 'file'}<span class="ml-1" style="color: #a5b4fc;">· from file</span>{/if}
 			{/if}
 		</span>
@@ -448,6 +1052,13 @@
 	>
 		Timeline{#if importSource === 'file'} <span class="ml-1 w-1.5 h-1.5 rounded-full inline-block" style="background-color: #6366f1; vertical-align: middle;"></span>{/if}
 	</button>
+	<button
+		onclick={() => switchTab('lifetime')}
+		class="px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors"
+		style="border-color: {activeTab === 'lifetime' ? 'var(--color-accent)' : 'transparent'}; color: {activeTab === 'lifetime' ? 'var(--color-text)' : 'var(--color-muted)'};"
+	>
+		Lifetime
+	</button>
 </div>
 
 <!-- ── INSTANCES TAB ── -->
@@ -458,25 +1069,92 @@
 		</div>
 	{/if}
 
+	<!-- Search & filter bar -->
+	<div class="flex flex-wrap items-center gap-2 mb-3">
+		<div class="relative flex-1 min-w-48">
+			<svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 pointer-events-none" style="color: var(--color-muted);" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+			<input
+				type="text"
+				placeholder="Search name or ID…"
+				bind:value={searchText}
+				class="w-full rounded pl-8 pr-3 py-1.5 text-sm border"
+				style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);"
+			/>
+		</div>
+		<select bind:value={filterType} class="rounded px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
+			<option value="">All types</option>
+			{#each distinctTypes as t}<option value={t}>{t}</option>{/each}
+		</select>
+		<select bind:value={filterAZ} class="rounded px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
+			<option value="">All AZs</option>
+			{#each distinctAZs as az}<option value={az}>{az}</option>{/each}
+		</select>
+		{#if hasActiveFilters}
+			<button onclick={clearFilters} class="text-xs rounded px-2.5 py-1.5 border transition-colors" style="border-color: var(--color-border); color: var(--color-muted);">Clear filters</button>
+		{/if}
+	</div>
+
+	<!-- Stats strip -->
+	{#if !loading && instances.length > 0}
+		<div class="flex flex-wrap items-center gap-2 mb-3">
+			{#if stateCounts.running > 0}
+				<button onclick={() => toggleStateFilter('running')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: {filterStates.has('running') ? '#22c55e33' : 'var(--color-surface)'}; border: 1px solid {filterStates.has('running') ? '#22c55e' : 'var(--color-border)'}; color: {filterStates.has('running') ? '#22c55e' : 'var(--color-muted)'};">
+					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #22c55e;"></span>
+					{stateCounts.running} running
+				</button>
+			{/if}
+			{#if stateCounts.stopped > 0}
+				<button onclick={() => toggleStateFilter('stopped')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: {filterStates.has('stopped') ? '#eab30833' : 'var(--color-surface)'}; border: 1px solid {filterStates.has('stopped') ? '#eab308' : 'var(--color-border)'}; color: {filterStates.has('stopped') ? '#eab308' : 'var(--color-muted)'};">
+					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #eab308;"></span>
+					{stateCounts.stopped} stopped
+				</button>
+			{/if}
+			{#if stateCounts.terminated > 0}
+				<button onclick={() => toggleStateFilter('terminated')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: {filterStates.has('terminated') ? '#ef444433' : 'var(--color-surface)'}; border: 1px solid {filterStates.has('terminated') ? '#ef4444' : 'var(--color-border)'}; color: {filterStates.has('terminated') ? '#ef4444' : 'var(--color-muted)'};">
+					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #ef4444;"></span>
+					{stateCounts.terminated} terminated
+				</button>
+			{/if}
+			{#if stateCounts.other > 0}
+				<button onclick={() => toggleStateFilter('pending')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: var(--color-surface); border: 1px solid var(--color-border); color: var(--color-muted);">
+					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #71717a;"></span>
+					{stateCounts.other} other
+				</button>
+			{/if}
+			<span class="text-xs ml-1" style="color: var(--color-muted);">{enrichedInstances.length} total</span>
+		</div>
+	{/if}
+
 	<div class="rounded-lg border overflow-hidden" style="border-color: var(--color-border);">
 		<div class="overflow-x-auto">
 			<table class="w-full text-sm">
 				<thead>
 					<tr style="background-color: var(--color-surface); border-bottom: 1px solid var(--color-border);">
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">Name</th>
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">Instance ID</th>
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">State</th>
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">Type</th>
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">AZ</th>
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">Launch Time</th>
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">First Started</th>
-						<th class="text-left px-4 py-3 font-semibold" style="color: var(--color-muted);">Username</th>
+						<th class="px-2 py-3 w-8"></th>
+						{#each [['name','Name'],['id','Instance ID'],['state','State'],['type','Type'],['az','AZ'],['launch','Launch Time'],['started','First Started'],['username','Username']] as [col, label]}
+							<th
+								class="text-left px-4 py-3 font-semibold cursor-pointer select-none whitespace-nowrap"
+								style="color: var(--color-muted);"
+								onclick={() => toggleSort(col)}
+							>
+								{label}
+								{#if col === 'started' || col === 'username'}
+									{#if eventsLoading}<svg class="inline w-3 h-3 animate-spin ml-1" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>{/if}
+								{/if}
+								{#if sortCol === col}
+									<svg class="inline w-3 h-3 ml-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+										{#if sortDir === 'asc'}<polyline points="18 15 12 9 6 15"/>{:else}<polyline points="6 9 12 15 18 9"/>{/if}
+									</svg>
+								{/if}
+							</th>
+						{/each}
 					</tr>
 				</thead>
 				<tbody>
 					{#if loading}
 						{#each { length: 5 } as _}
 							<tr style="border-bottom: 1px solid var(--color-border);">
+								<td class="px-2 py-3 w-8"></td>
 								{#each { length: 8 } as _}
 									<td class="px-4 py-3"><div class="h-4 rounded animate-pulse w-24" style="background-color: var(--color-border);"></div></td>
 								{/each}
@@ -484,18 +1162,45 @@
 						{/each}
 					{:else if instances.length === 0 && !error}
 						<tr>
-							<td colspan="8" class="px-4 py-12 text-center" style="color: var(--color-muted);">No instances found in {region}</td>
+							<td colspan="9" class="px-4 py-12 text-center" style="color: var(--color-muted);">No instances found in {region}</td>
+						</tr>
+					{:else if sortedInstances.length === 0 && hasActiveFilters}
+						<tr>
+							<td colspan="9" class="px-4 py-12 text-center" style="color: var(--color-muted);">
+								No instances match the current filters.
+								<button onclick={clearFilters} class="ml-2 underline" style="color: var(--color-accent);">Clear filters</button>
+							</td>
 						</tr>
 					{:else}
-						{#each instances as inst (inst.instance_id)}
+						{#each sortedInstances as inst (inst.instance_id)}
+							{@const isExpanded = expandedId === inst.instance_id}
+							{@const isActing = actionLoading === inst.instance_id}
 							<tr
-								class="transition-colors"
-								style="border-bottom: 1px solid var(--color-border);"
+								class="transition-colors cursor-pointer"
+								style="border-bottom: {isExpanded ? 'none' : '1px solid var(--color-border)'};"
+								onclick={() => { expandedId = isExpanded ? null : inst.instance_id; confirmTerminateId = null; confirmInput = ''; editingTagsId = null; }}
 								onmouseenter={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--color-surface)'}
-								onmouseleave={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = ''}
+								onmouseleave={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = isExpanded ? 'var(--color-surface)' : ''}
 							>
+								<td class="px-2 py-3 w-8 text-center">
+									<svg class="w-3.5 h-3.5 inline transition-transform" style="color: var(--color-muted); transform: rotate({isExpanded ? '90deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+								</td>
 								<td class="px-4 py-3 font-medium">{inst.name}</td>
-								<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.instance_id}</td>
+								<td class="px-4 py-3 font-mono text-xs group/iid" style="color: var(--color-muted);">
+									{inst.instance_id}
+									<button
+										onclick={(e) => copyToClipboard(inst.instance_id, e)}
+										class="ml-1 opacity-0 group-hover/iid:opacity-100 transition-opacity"
+										title={copiedValue === inst.instance_id ? 'Copied!' : 'Copy ID'}
+										style="color: {copiedValue === inst.instance_id ? '#22c55e' : 'var(--color-muted)'};"
+									>
+										{#if copiedValue === inst.instance_id}
+											<svg class="inline w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+										{:else}
+											<svg class="inline w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+										{/if}
+									</button>
+								</td>
 								<td class="px-4 py-3">
 									<span class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium"
 										style="background-color: {stateColor(inst.state)}22; color: {stateColor(inst.state)};">
@@ -507,20 +1212,223 @@
 								<td class="px-4 py-3" style="color: var(--color-muted);">{inst.availability_zone}</td>
 								<td class="px-4 py-3 whitespace-nowrap" title={inst.launch_time}>{fmtDate(inst.launch_time)}</td>
 								<td class="px-4 py-3 whitespace-nowrap">
-									{#if inst.first_started}
+									{#if eventsLoading && !inst.first_started}
+										<span style="color: var(--color-muted);">···</span>
+									{:else if inst.first_started}
 										<span title={inst.first_started}>{fmtDate(inst.first_started)}</span>
 									{:else}
-										<span title="No CloudTrail RunInstances event found — instance may be older than 90 days or CloudTrail access is restricted" style="color: var(--color-muted);" class="cursor-help">N/A</span>
+										<span title="No RunInstances event found — instance may pre-date the 90-day CloudTrail retention window" style="color: var(--color-muted);" class="cursor-help">—</span>
 									{/if}
 								</td>
 								<td class="px-4 py-3">
-									{#if inst.username}
-										<span class="font-mono text-xs">{inst.username}</span>
+									{#if eventsLoading && !inst.username}
+										<span style="color: var(--color-muted);">···</span>
+									{:else if inst.username}
+										<span class="font-mono text-xs" title={inst.username}>{shortUsername(inst.username)}</span>
 									{:else}
-										<span title="No CloudTrail RunInstances event found — instance may be older than 90 days or CloudTrail access is restricted" style="color: var(--color-muted);" class="cursor-help">N/A</span>
+										<span title="No RunInstances event found — instance may pre-date the 90-day CloudTrail retention window" style="color: var(--color-muted);" class="cursor-help">—</span>
 									{/if}
 								</td>
 							</tr>
+
+							{#if isExpanded}
+								<tr style="border-bottom: 1px solid var(--color-border); background-color: var(--color-surface);">
+									<td colspan="9" class="px-4 pb-4 pt-3">
+
+										<!-- Network + instance metadata grid -->
+										<div class="grid grid-cols-2 gap-4 mb-4 text-xs">
+											<div>
+												<p class="font-semibold mb-2" style="color: var(--color-muted);">NETWORK</p>
+												<dl class="space-y-1">
+													{#each [['Private IP', inst.private_ip], ['Public IP', inst.public_ip], ['VPC', inst.vpc_id], ['Subnet', inst.subnet_id]] as [label, val]}
+														<div class="flex gap-2 group/copyfield">
+															<dt class="w-24 shrink-0" style="color: var(--color-muted);">{label}</dt>
+															<dd class="font-mono flex items-center gap-1">
+																{val ?? '—'}
+																{#if val}
+																	<button onclick={(e) => copyToClipboard(val, e)} class="opacity-0 group-hover/copyfield:opacity-100 transition-opacity" title={copiedValue === val ? 'Copied!' : 'Copy'} style="color: {copiedValue === val ? '#22c55e' : 'var(--color-muted)'};">
+																		{#if copiedValue === val}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>{:else}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}
+																	</button>
+																{/if}
+															</dd>
+														</div>
+													{/each}
+													{#if inst.security_groups?.length}
+														<div class="flex gap-2">
+															<dt class="w-24 shrink-0" style="color: var(--color-muted);">Sec Groups</dt>
+															<dd class="flex flex-wrap gap-1">
+																{#each inst.security_groups as sg}
+																	<span class="rounded px-1.5 py-0.5 font-mono text-xs" style="background-color: var(--color-border);">{sg.name} <span style="color: var(--color-muted);">({sg.id})</span></span>
+																{/each}
+															</dd>
+														</div>
+													{/if}
+												</dl>
+											</div>
+											<div>
+												<p class="font-semibold mb-2" style="color: var(--color-muted);">INSTANCE</p>
+												<dl class="space-y-1">
+													{#each [['AMI', inst.image_id], ['Key Pair', inst.key_name], ['Architecture', inst.architecture]] as [label, val]}
+														<div class="flex gap-2">
+															<dt class="w-28 shrink-0" style="color: var(--color-muted);">{label}</dt>
+															<dd class="font-mono">{val ?? '—'}</dd>
+														</div>
+													{/each}
+													{#if inst.iam_profile}
+														<div class="flex gap-2">
+															<dt class="w-28 shrink-0" style="color: var(--color-muted);">IAM Profile</dt>
+															<dd class="font-mono text-xs truncate max-w-xs" title={inst.iam_profile}>{shortUsername(inst.iam_profile)}</dd>
+														</div>
+													{/if}
+												</dl>
+											</div>
+										</div>
+
+										<!-- Event History -->
+										<div class="border-t pt-3 mb-4" style="border-color: var(--color-border);">
+											<p class="text-xs font-semibold mb-2" style="color: var(--color-muted);">EVENT HISTORY</p>
+											<dl class="space-y-1 text-xs">
+												{#each [
+													{ label: 'First Launched', event: 'RunInstances',       value: inst.first_started,    by: inst.username },
+													{ label: 'Last Started',   event: 'StartInstances',    value: inst.last_started,     by: inst.last_started_by },
+													{ label: 'Last Stopped',   event: 'StopInstances',     value: inst.last_stopped,     by: inst.last_stopped_by },
+													{ label: 'Terminated',     event: 'TerminateInstances',value: inst.last_terminated,  by: inst.last_terminated_by },
+												] as row}
+													<div class="flex gap-2 items-center">
+														<span class="w-1.5 h-1.5 rounded-full shrink-0" style="background-color: {eventColor(row.event)};"></span>
+														<dt class="w-28 shrink-0" style="color: var(--color-muted);">{row.label}</dt>
+														<dd>
+															{#if eventsLoading && !row.value}
+																<span style="color: var(--color-muted);">···</span>
+															{:else if row.value}
+																<span title={row.value}>{fmtDate(row.value)}</span>
+																{#if row.by}
+																	<span class="ml-1" style="color: var(--color-muted);">by {shortUsername(row.by)}</span>
+																{/if}
+															{:else}
+																<span title="No event found in CloudTrail window" style="color: var(--color-muted);">—</span>
+															{/if}
+														</dd>
+													</div>
+												{/each}
+											</dl>
+										</div>
+
+										<!-- Tags -->
+										<div class="border-t pt-3 mb-4" style="border-color: var(--color-border);">
+											<div class="flex items-center gap-2 mb-2">
+												<p class="text-xs font-semibold" style="color: var(--color-muted);">TAGS</p>
+												{#if editingTagsId !== inst.instance_id}
+													<button onclick={(e) => { e.stopPropagation(); startTagEdit(inst); }}
+														class="text-xs rounded px-2 py-0.5 border transition-colors"
+														style="border-color: var(--color-border); color: var(--color-muted);">Edit tags</button>
+												{/if}
+											</div>
+
+											{#if editingTagsId === inst.instance_id}
+												<div onclick={(e) => e.stopPropagation()} role="presentation">
+													{#each draftTags as tag, i}
+														<div class="flex gap-2 mb-1.5 items-center">
+															<input type="text" bind:value={tag.Key} placeholder="Key"
+																class="rounded px-2 py-1 text-xs border w-36 font-mono"
+																style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);" />
+															<input type="text" bind:value={tag.Value} placeholder="Value"
+																class="rounded px-2 py-1 text-xs border flex-1 font-mono"
+																style="background-color: var(--color-bg); border-color: var(--color-border); color: var(--color-text);" />
+															<button onclick={() => draftTags = draftTags.filter((_, j) => j !== i)}
+																class="text-xs rounded px-1.5 py-1" style="color: #f87171;">✕</button>
+														</div>
+													{/each}
+													<div class="flex gap-2 mt-2">
+														<button onclick={() => draftTags = [...draftTags, { Key: '', Value: '' }]}
+															class="text-xs rounded px-2 py-1 border transition-colors"
+															style="border-color: var(--color-border); color: var(--color-muted);">+ Add tag</button>
+														<button onclick={() => saveTagEdit(inst.instance_id, inst.tags)}
+															disabled={isActing}
+															class="text-xs rounded px-2 py-1 transition-colors disabled:opacity-40"
+															style="background-color: var(--color-accent); color: white;">
+															{isActing ? 'Saving…' : 'Save'}
+														</button>
+														<button onclick={() => editingTagsId = null}
+															class="text-xs rounded px-2 py-1 border transition-colors"
+															style="border-color: var(--color-border); color: var(--color-muted);">Cancel</button>
+													</div>
+												</div>
+											{:else}
+												<div class="flex flex-wrap gap-1">
+													{#each (inst.tags ?? []) as tag}
+														<span class="rounded px-2 py-0.5 text-xs font-mono" style="background-color: var(--color-border);">
+															{tag.Key}: <span style="color: var(--color-muted);">{tag.Value}</span>
+														</span>
+													{/each}
+													{#if !(inst.tags?.length)}
+														<span class="text-xs" style="color: var(--color-muted);">No tags</span>
+													{/if}
+												</div>
+											{/if}
+										</div>
+
+										<!-- Actions -->
+										<div class="border-t pt-3" style="border-color: var(--color-border);">
+											{#if actionError[inst.instance_id]}
+												<p class="text-xs mb-2 rounded px-2 py-1" style="background-color: #1f0a0a; color: #fca5a5;">{actionError[inst.instance_id]}</p>
+											{/if}
+
+											{#if confirmTerminateId === inst.instance_id}
+												<div class="flex items-center gap-2" onclick={(e) => e.stopPropagation()} role="presentation">
+													<span class="text-xs" style="color: var(--color-muted);">Type <code class="font-mono" style="color: #f87171;">{inst.instance_id}</code> to confirm:</span>
+													<input type="text" bind:value={confirmInput} placeholder={inst.instance_id}
+														class="rounded px-2 py-1 text-xs border font-mono w-52"
+														style="background-color: var(--color-bg); border-color: #7f1d1d; color: var(--color-text);" />
+													<button
+														onclick={() => doAction(inst.instance_id, 'terminate')}
+														disabled={confirmInput !== inst.instance_id || isActing}
+														class="text-xs rounded px-3 py-1 font-medium transition-colors disabled:opacity-40"
+														style="background-color: #7f1d1d; color: #fca5a5;">
+														{isActing ? 'Terminating…' : 'Terminate'}
+													</button>
+													<button onclick={(e) => { e.stopPropagation(); confirmTerminateId = null; confirmInput = ''; }}
+														class="text-xs rounded px-2 py-1 border transition-colors"
+														style="border-color: var(--color-border); color: var(--color-muted);">Cancel</button>
+												</div>
+											{:else}
+												<div class="flex gap-2" onclick={(e) => e.stopPropagation()} role="presentation">
+													<button
+														onclick={() => doAction(inst.instance_id, 'start')}
+														disabled={inst.state !== 'stopped' || isActing}
+														class="flex items-center gap-1.5 text-xs rounded px-3 py-1.5 font-medium border transition-colors disabled:opacity-30"
+														style="border-color: #166534; color: #86efac;">
+														{#if isActing && actionLoading === inst.instance_id}<svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>{/if}
+														▶ Start
+													</button>
+													<button
+														onclick={() => doAction(inst.instance_id, 'stop')}
+														disabled={inst.state !== 'running' || isActing}
+														class="flex items-center gap-1.5 text-xs rounded px-3 py-1.5 font-medium border transition-colors disabled:opacity-30"
+														style="border-color: #713f12; color: #fde68a;">
+														■ Stop
+													</button>
+													<button
+														onclick={() => doAction(inst.instance_id, 'reboot')}
+														disabled={inst.state !== 'running' || isActing}
+														class="flex items-center gap-1.5 text-xs rounded px-3 py-1.5 font-medium border transition-colors disabled:opacity-30"
+														style="border-color: #1e3a5f; color: #93c5fd;">
+														↺ Reboot
+													</button>
+													<button
+														onclick={(e) => { e.stopPropagation(); confirmTerminateId = inst.instance_id; confirmInput = ''; }}
+														disabled={inst.state === 'terminated' || isActing}
+														class="flex items-center gap-1.5 text-xs rounded px-3 py-1.5 font-medium border transition-colors disabled:opacity-30"
+														style="border-color: #7f1d1d; color: #fca5a5;">
+														✕ Terminate
+													</button>
+												</div>
+											{/if}
+										</div>
+
+									</td>
+								</tr>
+							{/if}
 						{/each}
 					{/if}
 				</tbody>
@@ -529,7 +1437,7 @@
 	</div>
 
 <!-- ── TIMELINE TAB ── -->
-{:else}
+{:else if activeTab === 'timeline'}
 	{#if importError}
 		<div class="mb-4 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">
 			<strong>Import error:</strong> {importError}
@@ -539,6 +1447,37 @@
 	{#if eventsError && importSource === 'api'}
 		<div class="mb-4 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">
 			<strong>AWS Error:</strong> {eventsError}
+		</div>
+	{/if}
+
+	<!-- Timeline filters -->
+	{#if activeEvents.length > 0 || tlFilterFrom || tlFilterTo || tlFilterEvents.size > 0 || tlFilterUser || tlFilterInstanceId}
+		<div class="flex flex-wrap items-center gap-2 mb-4">
+			{#if tlFilterInstanceId}
+				<span class="flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium" style="background-color: #6366f122; color: #a5b4fc; border: 1px solid #6366f144;">
+					Instance: {instanceNameMap[tlFilterInstanceId] ?? tlFilterInstanceId}
+					<button onclick={() => tlFilterInstanceId = ''} class="opacity-70 hover:opacity-100">✕</button>
+				</span>
+			{/if}
+			<div class="flex gap-1">
+				{#each [['RunInstances','Launched','#6366f1'],['StartInstances','Started','#22c55e'],['StopInstances','Stopped','#eab308'],['TerminateInstances','Terminated','#ef4444']] as [name, label, color]}
+					<button
+						onclick={() => toggleTlEventFilter(name)}
+						class="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors"
+						style="background-color: {tlFilterEvents.has(name) ? color + '33' : 'var(--color-surface)'}; border: 1px solid {tlFilterEvents.has(name) ? color : 'var(--color-border)'}; color: {tlFilterEvents.has(name) ? color : 'var(--color-muted)'};"
+					>
+						<span class="w-1.5 h-1.5 rounded-full" style="background-color: {color};"></span>
+						{label}
+					</button>
+				{/each}
+			</div>
+			<input type="date" bind:value={tlFilterFrom} class="rounded px-2 py-1.5 text-xs border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);" title="From date" />
+			<input type="date" bind:value={tlFilterTo} class="rounded px-2 py-1.5 text-xs border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);" title="To date" />
+			<input type="text" bind:value={tlFilterUser} placeholder="Filter user…" class="rounded px-2.5 py-1.5 text-xs border w-40" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);" />
+			{#if tlFilterFrom || tlFilterTo || tlFilterEvents.size > 0 || tlFilterUser || tlFilterInstanceId}
+				<button onclick={() => { tlFilterFrom = ''; tlFilterTo = ''; tlFilterEvents = new Set(); tlFilterUser = ''; tlFilterInstanceId = ''; }} class="text-xs rounded px-2.5 py-1.5 border transition-colors" style="border-color: var(--color-border); color: var(--color-muted);">Clear all</button>
+				<span class="text-xs ml-1" style="color: var(--color-muted);">{filteredActiveEvents.length} of {activeEvents.length} events</span>
+			{/if}
 		</div>
 	{/if}
 
@@ -637,4 +1576,205 @@
 			{/each}
 		</div>
 	{/if}
+<!-- ── LIFETIME TAB ── -->
+{:else if activeTab === 'lifetime'}
+	<!-- Zoom controls -->
+	<div class="flex flex-wrap items-center gap-3 mb-4">
+		<span class="text-xs font-semibold" style="color: var(--color-muted);">ZOOM</span>
+		<input type="date" bind:value={ganttZoomFrom} class="rounded px-2 py-1.5 text-xs border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);" title="Zoom from" />
+		<span class="text-xs" style="color: var(--color-muted);">→</span>
+		<input type="date" bind:value={ganttZoomTo} class="rounded px-2 py-1.5 text-xs border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);" title="Zoom to" />
+		{#if ganttZoomFrom || ganttZoomTo}
+			<button onclick={() => { ganttZoomFrom = ''; ganttZoomTo = ''; }} class="text-xs rounded px-2.5 py-1.5 border transition-colors" style="border-color: var(--color-border); color: var(--color-muted);">Reset zoom</button>
+		{/if}
+		<div class="flex items-center gap-3 ml-auto text-xs" style="color: var(--color-muted);">
+			<span><span class="inline-block w-3 h-3 rounded-sm mr-1" style="background-color: #22c55e88;"></span>running</span>
+			<span><span class="inline-block w-3 h-3 rounded-sm mr-1" style="background-color: #eab30888;"></span>stopped</span>
+			<span><span class="inline-block w-3 h-3 rounded-sm mr-1" style="background-color: #ef444488;"></span>terminated</span>
+			<span style="color: var(--color-muted);">┆ dashed = origin unknown</span>
+		</div>
+	</div>
+
+	{#if ganttRows.length === 0 && !eventsLoading}
+		<div class="rounded-lg border p-10 text-center" style="border-color: var(--color-border); border-style: dashed;">
+			<svg class="w-8 h-8 mx-auto mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--color-muted);">
+				<path d="M9 19v-6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2zm0 0V9a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v10m-6 0a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2m0 0V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2z"/>
+			</svg>
+			<p class="text-sm font-medium mb-1">No lifetime data yet</p>
+			<p class="text-xs mb-4" style="color: var(--color-muted);">Load CloudTrail events to see instance lifecycles, or instances will appear from their launch time.</p>
+			{#if !eventsLoaded}
+				<button onclick={loadEventsData} disabled={eventsLoading} class="inline-flex items-center gap-2 rounded px-4 py-2 text-sm font-medium disabled:opacity-50" style="background-color: var(--color-accent); color: white;">
+					Load CloudTrail Events
+				</button>
+			{/if}
+		</div>
+	{:else if eventsLoading && ganttRows.length === 0}
+		<div class="flex items-center gap-3 py-8 text-sm" style="color: var(--color-muted);">
+			<svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+			Loading events…
+		</div>
+	{:else}
+		<!-- Gantt chart -->
+		<div class="rounded-lg border overflow-hidden relative" style="border-color: var(--color-border);">
+			<div class="flex" style="min-height: {GANTT_HDR_H + ganttRows.length * GANTT_ROW_H}px;">
+
+				<!-- Label column (fixed, non-scrolling) -->
+				<div class="shrink-0 border-r" style="width: 224px; border-color: var(--color-border); background-color: var(--color-surface);">
+					<div class="border-b flex items-end px-3 pb-1" style="height: {GANTT_HDR_H}px; border-color: var(--color-border);">
+						<span class="text-xs font-semibold" style="color: var(--color-muted);">INSTANCE</span>
+					</div>
+					{#each ganttRows as row}
+						<div
+							role="button"
+							tabindex="0"
+							class="flex items-center gap-1.5 px-3 border-b cursor-pointer transition-colors"
+							style="height: {GANTT_ROW_H}px; border-color: var(--color-border);"
+							title="Click to view events for this instance"
+							onclick={() => jumpToTimeline(row.instanceId)}
+							onkeydown={(e) => e.key === 'Enter' && jumpToTimeline(row.instanceId)}
+							onmouseenter={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--color-border)'}
+							onmouseleave={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = ''}
+						>
+							<span class="text-xs font-medium truncate flex-1">{row.name}</span>
+							<span class="rounded-full px-1.5 py-0.5 shrink-0" style="font-size: 9px; background-color: {stateColor(row.currentState)}22; color: {stateColor(row.currentState)};">{row.currentState}</span>
+						</div>
+					{/each}
+				</div>
+
+				<!-- Scrollable chart area -->
+				<div bind:this={ganttScrollEl} class="flex-1 overflow-x-auto">
+					<svg
+						width={ganttSvgWidth}
+						height={GANTT_HDR_H + ganttRows.length * GANTT_ROW_H}
+						style="display: block;"
+					>
+						<!-- Time axis ticks and grid lines -->
+						{#each ganttTicks(ganttViewRange.min, ganttViewRange.max, ganttSvgWidth) as tick}
+							<line x1={tick.x} y1={0} x2={tick.x} y2={GANTT_HDR_H + ganttRows.length * GANTT_ROW_H} stroke="var(--color-border)" stroke-width="1" />
+							<text x={tick.x + 4} y={GANTT_HDR_H - 8} font-size="10" fill="var(--color-muted)">{tick.label}</text>
+						{/each}
+						<line x1={0} y1={GANTT_HDR_H} x2={ganttSvgWidth} y2={GANTT_HDR_H} stroke="var(--color-border)" stroke-width="1" />
+
+						<!-- Rows -->
+						{#each ganttRows as row, i}
+							{@const yRow = GANTT_HDR_H + i * GANTT_ROW_H}
+							{@const yBar = yRow + (GANTT_ROW_H - GANTT_BAR_H) / 2}
+							{@const range = ganttViewRange.max - ganttViewRange.min}
+
+							<!-- Row separator -->
+							<line x1={0} y1={yRow + GANTT_ROW_H} x2={ganttSvgWidth} y2={yRow + GANTT_ROW_H} stroke="var(--color-border)" stroke-width="1" opacity="0.4" />
+
+							<!-- Segments -->
+							{#each row.segments as seg}
+								{@const x1 = Math.max(0, (seg.start - ganttViewRange.min) / range * ganttSvgWidth)}
+								{@const x2 = Math.min(ganttSvgWidth, (seg.end - ganttViewRange.min) / range * ganttSvgWidth)}
+								{#if x2 > x1 + 0.5}
+									<rect
+										role="button"
+										tabindex="0"
+										x={x1} y={yBar}
+										width={x2 - x1} height={GANTT_BAR_H}
+										rx="3" ry="3"
+										fill={stateColor(seg.state)}
+										opacity={seg.dashed ? 0.5 : 0.75}
+										style="cursor: pointer;"
+										onmouseenter={(e: MouseEvent) => ganttTooltip = { x: e.clientX, y: e.clientY, row, seg }}
+										onmousemove={(e: MouseEvent) => { if (ganttTooltip) ganttTooltip = { ...ganttTooltip, x: e.clientX, y: e.clientY }; }}
+										onmouseleave={() => ganttTooltip = null}
+										onclick={() => jumpToTimeline(row.instanceId)}
+										onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && jumpToTimeline(row.instanceId)}
+									/>
+									{#if seg.dashed}
+										<line x1={x1} y1={yBar} x2={x1} y2={yBar + GANTT_BAR_H} stroke="white" stroke-dasharray="2 2" stroke-width="2" opacity="0.7" />
+									{/if}
+								{/if}
+							{/each}
+						{/each}
+
+						<!-- "Now" marker -->
+						{#if Date.now() > ganttViewRange.min && Date.now() < ganttViewRange.max}
+							{@const nowX = (Date.now() - ganttViewRange.min) / (ganttViewRange.max - ganttViewRange.min) * ganttSvgWidth}
+							<line x1={nowX} y1={0} x2={nowX} y2={GANTT_HDR_H + ganttRows.length * GANTT_ROW_H} stroke="#ef4444" stroke-dasharray="4 3" stroke-width="1.5" opacity="0.65" />
+							<text x={nowX + 3} y={14} font-size="9" fill="#ef4444" font-weight="600">now</text>
+						{/if}
+					</svg>
+				</div>
+			</div>
+
+			<!-- Summary footer -->
+			<div class="px-4 py-2 border-t text-xs flex items-center gap-3" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-muted);">
+				<span>{ganttRows.length} instance{ganttRows.length !== 1 ? 's' : ''}</span>
+				<span>·</span>
+				<span>{new Date(ganttViewRange.min).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} → {new Date(ganttViewRange.max).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+				<span class="ml-auto">Click a bar or row label to view events in Timeline</span>
+			</div>
+		</div>
+	{/if}
+
+	<!-- Tooltip -->
+	{#if ganttTooltip}
+		<div
+			class="fixed z-[60] pointer-events-none rounded-lg border shadow-2xl px-3 py-2 text-xs"
+			style="left: {ganttTooltip.x + 14}px; top: {ganttTooltip.y - 70}px; background-color: var(--color-surface); border-color: var(--color-border); min-width: 180px;"
+		>
+			<p class="font-semibold mb-1 truncate">{ganttTooltip.row.name}</p>
+			<p class="flex items-center gap-1.5 mb-1">
+				<span class="w-2 h-2 rounded-full" style="background-color: {stateColor(ganttTooltip.seg.state)};"></span>
+				<span style="color: {stateColor(ganttTooltip.seg.state)};">{ganttTooltip.seg.state}</span>
+			</p>
+			<p style="color: var(--color-muted);">{fmtDate(new Date(ganttTooltip.seg.start).toISOString())}</p>
+			<p style="color: var(--color-muted);">→ {fmtDate(new Date(ganttTooltip.seg.end).toISOString())}</p>
+			<p class="mt-1 font-medium">{fmtDuration2(ganttTooltip.seg.end - ganttTooltip.seg.start)}</p>
+			{#if ganttTooltip.seg.dashed}
+				<p class="mt-1 italic" style="color: var(--color-muted); font-size: 9px;">Origin pre-dates event data</p>
+			{/if}
+		</div>
+	{/if}
 {/if}
+
+<!-- Bottom spacer so content isn't hidden behind the log tray -->
+<div class="h-10"></div>
+
+<!-- Log tray (fixed bottom) -->
+<div class="fixed bottom-0 left-0 right-0 z-50 flex flex-col" style="border-top: 1px solid var(--color-border);">
+	{#if logsOpen}
+		<div bind:this={logScrollEl} class="overflow-y-auto font-mono text-xs"
+			style="height: 200px; background-color: #0a0a0c;">
+			{#if logEntries.length === 0}
+				<p class="px-4 py-3" style="color: var(--color-muted);">No log entries yet.</p>
+			{:else}
+				{#each logEntries as entry (entry.id)}
+					<div class="flex gap-2 px-3 py-0.5 border-b items-baseline"
+						style="border-color: #1a1a1f; background-color: {entry.level === 'error' ? '#1f0a0a' : entry.level === 'warn' ? '#1a1500' : 'transparent'};">
+						<span class="shrink-0 tabular-nums" style="color: #4b5563;">{fmtTime(entry.time)}</span>
+						<span class="shrink-0 w-10 font-bold" style="color: {entry.level === 'error' ? '#f87171' : entry.level === 'warn' ? '#fbbf24' : '#6ee7b7'};">{entry.level.toUpperCase()}</span>
+						<span class="shrink-0 w-20" style="color: #6366f1;">[{entry.source}]</span>
+						<span class="flex-1 break-all" style="color: {entry.level === 'error' ? '#fca5a5' : entry.level === 'warn' ? '#fde68a' : 'var(--color-text)'};">{entry.message}</span>
+						{#if entry.duration !== undefined}
+							<span class="shrink-0 tabular-nums" style="color: #4b5563;">{fmtDuration(entry.duration)}</span>
+						{/if}
+					</div>
+				{/each}
+			{/if}
+		</div>
+	{/if}
+	<div class="flex items-center gap-2 px-3 py-1.5 cursor-pointer select-none"
+		style="background-color: var(--color-surface);"
+		onclick={() => logsOpen = !logsOpen} role="button" tabindex="0"
+		onkeydown={(e) => e.key === 'Enter' && (logsOpen = !logsOpen)}>
+		<svg class="w-3 h-3 transition-transform" style="color: var(--color-muted); transform: rotate({logsOpen ? '180deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
+		<span class="text-xs font-semibold" style="color: var(--color-muted);">LOGS</span>
+		{#if errorCount > 0}
+			<span class="rounded px-1.5 py-0.5 text-xs font-bold" style="background-color: #7f1d1d; color: #fca5a5;">{errorCount} error{errorCount !== 1 ? 's' : ''}</span>
+		{/if}
+		{#if !logsOpen && latestEntry}
+			<span class="font-mono text-xs truncate flex-1" style="color: {latestEntry.level === 'error' ? '#f87171' : latestEntry.level === 'warn' ? '#fbbf24' : '#4b5563'};">{fmtTime(latestEntry.time)} [{latestEntry.source}] {latestEntry.message}</span>
+		{/if}
+		<div class="ml-auto flex items-center gap-2">
+			{#if logEntries.length > 0}
+				<button onclick={(e) => { e.stopPropagation(); logEntries = []; }} class="text-xs rounded px-2 py-0.5 border transition-colors" style="border-color: var(--color-border); color: var(--color-muted);">Clear</button>
+			{/if}
+			<span class="text-xs tabular-nums" style="color: var(--color-muted);">{logEntries.length}</span>
+		</div>
+	</div>
+</div>

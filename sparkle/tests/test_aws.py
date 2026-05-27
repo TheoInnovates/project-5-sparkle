@@ -1,9 +1,8 @@
 """Unit tests for sparkle.aws using moto mocks."""
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -32,26 +31,10 @@ def _make_instance(
     }
 
 
-def _make_ct_event(iid: str, username: str, event_time: datetime) -> dict:
-    raw = json.dumps({
-        "userIdentity": {"userName": username, "type": "IAMUser"},
-        "eventName": "RunInstances",
-    })
-    return {
-        "EventName": "RunInstances",
-        "EventTime": event_time,
-        "CloudTrailEvent": raw,
-        "Resources": [{"ResourceName": iid}],
-    }
-
-
 @pytest.mark.asyncio
 async def test_instance_with_name_tag():
     inst = _make_instance(tags=[{"Key": "Name", "Value": "web-server-01"}])
-    with (
-        patch("sparkle.aws._get_ec2_instances", return_value=[inst]),
-        patch("sparkle.aws._lookup_first_run", return_value=(None, None)),
-    ):
+    with patch("sparkle.aws._get_ec2_instances", return_value=[inst]):
         from sparkle.aws import list_instances
         records = await list_instances("us-east-1")
     assert len(records) == 1
@@ -61,38 +44,27 @@ async def test_instance_with_name_tag():
 @pytest.mark.asyncio
 async def test_instance_without_name_tag_falls_back_to_id():
     inst = _make_instance(iid="i-0deadbeef0000001", tags=[])
-    with (
-        patch("sparkle.aws._get_ec2_instances", return_value=[inst]),
-        patch("sparkle.aws._lookup_first_run", return_value=(None, None)),
-    ):
+    with patch("sparkle.aws._get_ec2_instances", return_value=[inst]):
         from sparkle.aws import list_instances
         records = await list_instances("us-east-1")
     assert records[0].name == "i-0deadbeef0000001"
 
 
 @pytest.mark.asyncio
-async def test_cloudtrail_event_found():
-    iid = "i-0abc123def456789b"
-    inst = _make_instance(iid=iid)
-    first_time = datetime(2025, 11, 10, 9, 15, 0, tzinfo=timezone.utc)
-    with (
-        patch("sparkle.aws._get_ec2_instances", return_value=[inst]),
-        patch("sparkle.aws._lookup_first_run", return_value=(first_time.isoformat(), "alice")),
-    ):
+async def test_cloudtrail_fields_always_null_in_instances():
+    """list_instances no longer does per-instance CloudTrail lookups — fields come from list_events."""
+    inst = _make_instance()
+    with patch("sparkle.aws._get_ec2_instances", return_value=[inst]):
         from sparkle.aws import list_instances
         records = await list_instances("us-east-1")
-    r = records[0]
-    assert r.first_started == first_time.isoformat()
-    assert r.username == "alice"
+    assert records[0].first_started is None
+    assert records[0].username is None
 
 
 @pytest.mark.asyncio
 async def test_no_cloudtrail_event_returns_null():
     inst = _make_instance()
-    with (
-        patch("sparkle.aws._get_ec2_instances", return_value=[inst]),
-        patch("sparkle.aws._lookup_first_run", return_value=(None, None)),
-    ):
+    with patch("sparkle.aws._get_ec2_instances", return_value=[inst]):
         from sparkle.aws import list_instances
         records = await list_instances("us-east-1")
     assert records[0].first_started is None
@@ -109,10 +81,7 @@ async def test_results_cached():
         call_count += 1
         return [inst]
 
-    with (
-        patch("sparkle.aws._get_ec2_instances", side_effect=counting_ec2),
-        patch("sparkle.aws._lookup_first_run", return_value=(None, None)),
-    ):
+    with patch("sparkle.aws._get_ec2_instances", side_effect=counting_ec2):
         from sparkle.aws import list_instances
         await list_instances("us-east-1")
         await list_instances("us-east-1")
