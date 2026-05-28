@@ -186,7 +186,7 @@
 		terminated: '#ef4444',
 		pending: '#a78bfa',
 		stopping: '#f97316',
-		shutting_down: '#f97316'
+		'shutting-down': '#f97316'
 	};
 
 	const EVENT_LABELS: Record<string, string> = {
@@ -298,7 +298,10 @@
 				const q = searchText.toLowerCase();
 				if (!inst.name.toLowerCase().includes(q) && !inst.instance_id.toLowerCase().includes(q)) return false;
 			}
-			if (filterStates.size > 0 && !filterStates.has(inst.state)) return false;
+			if (filterStates.size > 0) {
+				const matchesOther = filterStates.has('other') && !STD_STATES.includes(inst.state);
+				if (!filterStates.has(inst.state) && !matchesOther) return false;
+			}
 			if (filterType && inst.instance_type !== filterType) return false;
 			if (filterAZ && inst.availability_zone !== filterAZ) return false;
 			if (filterMissingTags && requiredTags.length > 0) {
@@ -309,12 +312,18 @@
 		})
 	);
 
+	const STD_STATES = ['running', 'stopped', 'terminated'];
+
 	const stateCounts = $derived({
 		running: enrichedInstances.filter(i => i.state === 'running').length,
 		stopped: enrichedInstances.filter(i => i.state === 'stopped').length,
 		terminated: enrichedInstances.filter(i => i.state === 'terminated').length,
-		other: enrichedInstances.filter(i => !['running','stopped','terminated'].includes(i.state)).length,
+		other: enrichedInstances.filter(i => !STD_STATES.includes(i.state)).length,
 	});
+
+	const transitionalStateNames = $derived(
+		[...new Set(enrichedInstances.filter(i => !STD_STATES.includes(i.state)).map(i => i.state))].join(', ')
+	);
 
 	const runningEstimatedCost = $derived(
 		enrichedInstances
@@ -1577,6 +1586,8 @@
 							<p class="text-xs mt-1" style="color: var(--color-muted);">~{fmtCost(runningEstimatedCost)}/mo</p>
 						{:else if card.state === 'stopped' && count > 0}
 							<p class="text-xs mt-1" style="color: var(--color-muted);">EBS costs</p>
+						{:else if card.state === 'other' && transitionalStateNames}
+							<p class="text-xs mt-1 truncate" style="color: var(--color-muted);">{transitionalStateNames}</p>
 						{/if}
 					</button>
 				{/if}
