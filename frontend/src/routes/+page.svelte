@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { fetchS3Events, getConfig, listEvents, listInstances, listRegions, listVolumes, loadCredConfig, rebootInstance, searchByTag, startInstance, stopInstance, terminateInstance, updateTags } from '$lib/api';
-	import type { EBSVolume, InstanceEvent, InstanceRecord, TagResource } from '$lib/types';
-	import { estimateInstanceCostPerMonth, estimateEBSCostPerMonth, fmtCost } from '$lib/prices';
+	import { fetchS3Events, getConfig, listCostResources, listEvents, listInstances, listRegions, listVolumes, loadCredConfig, rebootInstance, searchByTag, startInstance, stopInstance, terminateInstance, updateTags } from '$lib/api';
+	import type { CostResource, EBSVolume, InstanceEvent, InstanceRecord, TagResource } from '$lib/types';
+	import { estimateInstanceCostPerMonth, estimateEBSCostPerMonth, fmtCost, resourceTypeMeta } from '$lib/prices';
 
 	let region = $state('us-east-1');
 	let regions = $state<string[]>([]);
@@ -37,6 +37,33 @@
 	let requiredTagsInput = $state('');
 	const requiredTags = $derived(
 		requiredTagsInput.split(',').map(s => s.trim()).filter(Boolean)
+	);
+
+	// ── Cost inventory ───────────────────────────────────────────────────────
+	let costInventoryMode = $state(false);
+	let costResources = $state<CostResource[]>([]);
+	let costResourcesLoading = $state(false);
+	let costResourcesLoaded = $state(false);
+	let costResourcesError = $state<string | null>(null);
+	let costSortCol = $state<'cost' | 'name' | 'type'>('cost');
+	let costFilterService = $state('');
+
+	const filteredCostResources = $derived(
+		[...costResources]
+			.filter(r => !costFilterService || r.resource_type === costFilterService)
+			.sort((a, b) =>
+				costSortCol === 'cost' ? b.estimated_monthly_usd - a.estimated_monthly_usd
+				: costSortCol === 'name' ? a.name.localeCompare(b.name)
+				: a.resource_type.localeCompare(b.resource_type)
+			)
+	);
+
+	const totalInventoryCost = $derived(
+		filteredCostResources.reduce((s, r) => s + r.estimated_monthly_usd, 0)
+	);
+
+	const distinctResourceTypes = $derived(
+		[...new Set(costResources.map(r => r.resource_type))].sort()
 	);
 
 	let events = $state<InstanceEvent[]>([]);
@@ -687,6 +714,24 @@
 			addLog('error', 'volumes', msg, Date.now() - t0);
 		} finally {
 			volumesLoading = false;
+		}
+	}
+
+	async function loadCostInventory() {
+		costResourcesLoading = true;
+		costResourcesError = null;
+		const t0 = Date.now();
+		addLog('info', 'cost', `Fetching cost inventory for ${region}…`);
+		try {
+			costResources = await listCostResources(region);
+			costResourcesLoaded = true;
+			addLog('info', 'cost', `Loaded ${costResources.length} billable resource${costResources.length !== 1 ? 's' : ''}`, Date.now() - t0);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			costResourcesError = msg;
+			addLog('error', 'cost', msg, Date.now() - t0);
+		} finally {
+			costResourcesLoading = false;
 		}
 	}
 
@@ -2256,6 +2301,137 @@
 		</div>
 	{/if}
 {:else if activeTab === 'resources'}
+	<!-- Mode toggle -->
+	<div class="flex gap-0 mb-4 border rounded-lg overflow-hidden w-fit text-sm" style="border-color: var(--color-border);">
+		<button
+			onclick={() => costInventoryMode = false}
+			class="px-4 py-1.5 font-medium transition-colors"
+			style="background-color: {!costInventoryMode ? 'var(--color-accent)' : 'transparent'}; color: {!costInventoryMode ? 'white' : 'var(--color-muted)'};"
+		>Tag Search</button>
+		<button
+			onclick={() => costInventoryMode = true}
+			class="px-4 py-1.5 font-medium transition-colors"
+			style="background-color: {costInventoryMode ? 'var(--color-accent)' : 'transparent'}; color: {costInventoryMode ? 'white' : 'var(--color-muted)'};"
+		>Cost Inventory</button>
+	</div>
+
+	{#if costInventoryMode}
+	<!-- Cost Inventory -->
+	<div>
+		<div class="flex flex-wrap items-center gap-2 mb-3">
+			<button
+				onclick={loadCostInventory}
+				disabled={costResourcesLoading}
+				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
+				style="background-color: var(--color-accent); color: white;"
+			>
+				{#if costResourcesLoading}
+					<svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+					Loading…
+				{:else}
+					{costResourcesLoaded ? 'Reload' : 'Load Cost Inventory'}
+				{/if}
+			</button>
+			{#if costResourcesLoaded}
+				<select bind:value={costFilterService} class="rounded px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
+					<option value="">All services</option>
+					{#each distinctResourceTypes as t}
+						{@const meta = resourceTypeMeta(t)}
+						<option value={t}>{meta.label}</option>
+					{/each}
+				</select>
+				<select bind:value={costSortCol} class="rounded px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
+					<option value="cost">Sort: Est. Cost</option>
+					<option value="name">Sort: Name</option>
+					<option value="type">Sort: Service</option>
+				</select>
+			{/if}
+		</div>
+
+		{#if costResourcesError}
+			<div class="mb-3 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">{costResourcesError}</div>
+		{/if}
+
+		{#if costResourcesLoaded && filteredCostResources.length > 0}
+			<!-- Total cost banner -->
+			<div class="mb-3 rounded-lg px-4 py-2.5 text-sm flex items-center gap-3 flex-wrap" style="background-color: var(--color-surface); border: 1px solid var(--color-border);">
+				<span class="font-semibold">Estimated total</span>
+				<span class="text-lg font-bold" style="color: var(--color-accent);">~{fmtCost(totalInventoryCost)}/mo</span>
+				<span style="color: var(--color-muted);">across {filteredCostResources.length} resource{filteredCostResources.length !== 1 ? 's' : ''}</span>
+				<span class="text-xs ml-auto" style="color: var(--color-muted);">Approximate on-demand prices, us-east-1. Actual costs may vary.</span>
+			</div>
+			<!-- Results table -->
+			<div class="rounded-lg border overflow-hidden" style="border-color: var(--color-border);">
+				<div class="overflow-x-auto">
+					<table class="w-full text-sm">
+						<thead>
+							<tr style="background-color: var(--color-surface); border-bottom: 1px solid var(--color-border);">
+								{#each ['Service','Name / ID','State','Size / Details','Est. Cost/mo'] as h}
+									<th class="text-left px-4 py-3 font-semibold text-xs whitespace-nowrap" style="color: var(--color-muted);">{h}</th>
+								{/each}
+							</tr>
+						</thead>
+						<tbody>
+							{#each filteredCostResources as r (r.resource_type + '/' + r.resource_id)}
+								{@const meta = resourceTypeMeta(r.resource_type)}
+								<tr
+									style="border-bottom: 1px solid var(--color-border);"
+									onmouseenter={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--color-surface)'}
+									onmouseleave={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = ''}
+								>
+									<td class="px-4 py-3">
+										<span class="inline-block rounded px-2 py-0.5 text-xs font-medium"
+											style="background-color: {meta.color}22; color: {meta.color};">{meta.label}</span>
+									</td>
+									<td class="px-4 py-3">
+										<span class="font-medium">{r.name}</span>
+										{#if r.name !== r.resource_id}
+											<span class="block font-mono text-xs" style="color: var(--color-muted);">{r.resource_id}</span>
+										{/if}
+									</td>
+									<td class="px-4 py-3">
+										<span class="inline-flex items-center gap-1 text-xs rounded-full px-2 py-0.5"
+											style="background-color: {r.state === 'running' || r.state === 'available' || r.state === 'active' ? '#22c55e22' : '#71717a22'}; color: {r.state === 'running' || r.state === 'available' || r.state === 'active' ? '#22c55e' : '#71717a'};">
+											{r.state}
+										</span>
+									</td>
+									<td class="px-4 py-3 text-xs" style="color: var(--color-muted);">{r.size_hint ?? '—'}</td>
+									<td class="px-4 py-3 font-semibold whitespace-nowrap" style="color: var(--color-text);">
+										{#if r.estimated_monthly_usd > 0}
+											~{fmtCost(r.estimated_monthly_usd)}/mo
+										{:else}
+											<span style="color: var(--color-muted);">—</span>
+										{/if}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			</div>
+		{:else if costResourcesLoaded && filteredCostResources.length === 0}
+			<div class="rounded-lg border p-10 text-center" style="border-color: var(--color-border); border-style: dashed;">
+				<p class="text-sm font-medium mb-1">No billable resources found</p>
+				<p class="text-xs" style="color: var(--color-muted);">No cost-generating resources were detected in {region} with the current credentials.</p>
+			</div>
+		{:else if !costResourcesLoading}
+			<div class="rounded-lg border p-10 text-center" style="border-color: var(--color-border); border-style: dashed;">
+				<svg class="w-8 h-8 mx-auto mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--color-muted);">
+					<path d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/>
+				</svg>
+				<p class="text-sm font-medium mb-1">Cost Inventory</p>
+				<p class="text-xs mb-4" style="color: var(--color-muted);">
+					Query EC2, EBS, RDS, NAT Gateways, Load Balancers, Elastic IPs, Snapshots, and ElastiCache<br/>
+					to see every resource currently incurring charges in {region}.
+				</p>
+				<button onclick={loadCostInventory} class="inline-flex items-center gap-2 rounded px-4 py-2 text-sm font-medium" style="background-color: var(--color-accent); color: white;">
+					Load Cost Inventory
+				</button>
+			</div>
+		{/if}
+	</div>
+
+	{:else}
 	<!-- Tag Resource Search -->
 	<div class="mb-4">
 		<div class="flex flex-wrap items-center gap-2 mb-3">
@@ -2372,6 +2548,7 @@
 			</div>
 		{/if}
 	</div>
+	{/if}
 {/if}
 
 <!-- Bottom spacer so content isn't hidden behind the log tray -->

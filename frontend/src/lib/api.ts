@@ -1,4 +1,4 @@
-import type { Config, CredConfig, EBSVolume, InstanceEvent, InstanceRecord, TagResource } from './types';
+import type { Config, CostResource, CredConfig, EBSVolume, InstanceEvent, InstanceRecord, TagResource } from './types';
 
 const STORAGE_KEY = 'sparkle_cred_config';
 
@@ -100,6 +100,9 @@ export const searchByTag = (region: string, key: string, value?: string): Promis
 
 export const listVolumes = (region: string): Promise<EBSVolume[]> =>
 	apiFetch<EBSVolume[]>(`/api/volumes?region=${encodeURIComponent(region)}`, loadCredConfig(), 30000);
+
+export const listCostResources = (region: string): Promise<CostResource[]> =>
+	apiFetch<CostResource[]>(`/api/cost-resources?region=${encodeURIComponent(region)}`, loadCredConfig(), 60000);
 
 export interface S3QueryParams {
 	bucket: string;

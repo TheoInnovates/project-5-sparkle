@@ -63,3 +63,20 @@ export function fmtCost(dollars: number): string {
 	if (dollars < 100) return `$${dollars.toFixed(2)}`;
 	return `$${Math.round(dollars).toLocaleString()}`;
 }
+
+// Service display metadata for cost inventory
+export const RESOURCE_TYPE_META: Record<string, { label: string; color: string }> = {
+	ec2_instance:   { label: 'EC2',         color: '#3b82f6' },
+	ebs_volume:     { label: 'EBS',         color: '#6366f1' },
+	ebs_snapshot:   { label: 'Snapshot',    color: '#8b5cf6' },
+	rds_instance:   { label: 'RDS',         color: '#f97316' },
+	aurora_cluster: { label: 'Aurora',      color: '#fb923c' },
+	nat_gateway:    { label: 'NAT GW',      color: '#06b6d4' },
+	load_balancer:  { label: 'ELB',         color: '#22c55e' },
+	elastic_ip:     { label: 'Elastic IP',  color: '#eab308' },
+	elasticache:    { label: 'ElastiCache', color: '#ec4899' },
+};
+
+export function resourceTypeMeta(type: string): { label: string; color: string } {
+	return RESOURCE_TYPE_META[type] ?? { label: type, color: '#71717a' };
+}

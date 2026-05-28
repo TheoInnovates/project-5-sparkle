@@ -557,6 +557,375 @@ def list_volumes(region: str, creds: Credentials | None) -> list[dict]:
     return vols
 
 
+# ── Cost inventory price tables ───────────────────────────────────────────────
+
+_HOURS_PER_MONTH = 730
+
+_EC2_HOURLY: dict[str, float] = {
+    "t3.nano": 0.0052, "t3.micro": 0.0104, "t3.small": 0.0208,
+    "t3.medium": 0.0416, "t3.large": 0.0832, "t3.xlarge": 0.1664, "t3.2xlarge": 0.3328,
+    "t3a.nano": 0.0047, "t3a.micro": 0.0094, "t3a.small": 0.0188,
+    "t3a.medium": 0.0376, "t3a.large": 0.0752, "t3a.xlarge": 0.1504,
+    "t4g.nano": 0.0042, "t4g.micro": 0.0084, "t4g.small": 0.0168,
+    "t4g.medium": 0.0336, "t4g.large": 0.0672, "t4g.xlarge": 0.1344,
+    "m5.large": 0.096, "m5.xlarge": 0.192, "m5.2xlarge": 0.384, "m5.4xlarge": 0.768,
+    "m6i.large": 0.096, "m6i.xlarge": 0.192, "m6i.2xlarge": 0.384,
+    "m6g.large": 0.077, "m6g.xlarge": 0.154, "m6g.2xlarge": 0.308,
+    "c5.large": 0.085, "c5.xlarge": 0.17, "c5.2xlarge": 0.34, "c5.4xlarge": 0.68,
+    "c6i.large": 0.085, "c6i.xlarge": 0.17, "c6i.2xlarge": 0.34,
+    "c6g.large": 0.068, "c6g.xlarge": 0.136, "c6g.2xlarge": 0.272,
+    "r5.large": 0.126, "r5.xlarge": 0.252, "r5.2xlarge": 0.504, "r5.4xlarge": 1.008,
+    "r6i.large": 0.126, "r6i.xlarge": 0.252, "r6i.2xlarge": 0.504,
+    "g4dn.xlarge": 0.526, "g4dn.2xlarge": 0.752, "g4dn.4xlarge": 1.204,
+    "p3.2xlarge": 3.06, "p3.8xlarge": 12.24,
+}
+
+_RDS_HOURLY: dict[str, float] = {
+    "db.t3.micro": 0.017, "db.t3.small": 0.034, "db.t3.medium": 0.068,
+    "db.t3.large": 0.136, "db.t3.xlarge": 0.272, "db.t3.2xlarge": 0.544,
+    "db.t4g.micro": 0.016, "db.t4g.small": 0.032, "db.t4g.medium": 0.065,
+    "db.t4g.large": 0.13, "db.t4g.xlarge": 0.26,
+    "db.m5.large": 0.19, "db.m5.xlarge": 0.38, "db.m5.2xlarge": 0.76,
+    "db.m5.4xlarge": 1.52, "db.m6g.large": 0.171, "db.m6g.xlarge": 0.342,
+    "db.r5.large": 0.24, "db.r5.xlarge": 0.48, "db.r5.2xlarge": 0.96,
+    "db.r5.4xlarge": 1.92, "db.r6g.large": 0.216, "db.r6g.xlarge": 0.432,
+    "db.r6i.large": 0.24, "db.r6i.xlarge": 0.48, "db.r6i.2xlarge": 0.96,
+}
+
+_ELASTICACHE_HOURLY: dict[str, float] = {
+    "cache.t3.micro": 0.017, "cache.t3.small": 0.034, "cache.t3.medium": 0.068,
+    "cache.t4g.micro": 0.016, "cache.t4g.small": 0.032, "cache.t4g.medium": 0.065,
+    "cache.m5.large": 0.156, "cache.m5.xlarge": 0.312, "cache.m5.2xlarge": 0.624,
+    "cache.m6g.large": 0.145, "cache.m6g.xlarge": 0.29,
+    "cache.r5.large": 0.166, "cache.r5.xlarge": 0.332,
+    "cache.r6g.large": 0.149, "cache.r6g.xlarge": 0.298,
+}
+
+_EBS_GB_MONTH: dict[str, float] = {
+    "gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125,
+    "st1": 0.045, "sc1": 0.018, "standard": 0.05,
+}
+
+_NAT_GW_HOURLY = 0.045
+_ELB_HOURLY = 0.008
+_EIP_HOURLY = 0.005
+_SNAPSHOT_GB_MONTH = 0.05
+_RDS_STORAGE_GB_MONTH = 0.115
+
+
+def _tags_to_list(raw: list | None) -> list[dict]:
+    if not raw:
+        return []
+    return [{"Key": t.get("Key", ""), "Value": t.get("Value", "")} for t in raw]
+
+
+def _iso_str(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def _fetch_ec2_cost_items(session: boto3.Session, region: str) -> list[dict]:
+    ec2 = session.client("ec2", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    try:
+        paginator = ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for reservation in page.get("Reservations", []):
+                for inst in reservation.get("Instances", []):
+                    state = inst.get("State", {}).get("Name", "")
+                    if state in ("terminated", "shutting-down"):
+                        continue
+                    itype = inst.get("InstanceType", "")
+                    hourly = _EC2_HOURLY.get(itype, 0.0)
+                    cost = hourly * _HOURS_PER_MONTH
+                    name = _name_from_tags(inst.get("Tags")) or inst["InstanceId"]
+                    az = inst.get("Placement", {}).get("AvailabilityZone", "")
+                    launch = inst.get("LaunchTime")
+                    results.append({
+                        "resource_type": "ec2_instance",
+                        "resource_id": inst["InstanceId"],
+                        "name": name,
+                        "arn": f"arn:aws:ec2:{region}::instance/{inst['InstanceId']}",
+                        "state": state,
+                        "region": region,
+                        "created_at": _iso_str(launch),
+                        "size_hint": f"{itype} / {az}",
+                        "estimated_monthly_usd": round(cost, 2),
+                        "tags": _tags_to_list(inst.get("Tags")),
+                    })
+    except Exception:  # nosec B110
+        pass
+    return results
+
+
+def _fetch_ebs_cost_items(session: boto3.Session, region: str) -> list[dict]:
+    ec2 = session.client("ec2", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    try:
+        paginator = ec2.get_paginator("describe_volumes")
+        for page in paginator.paginate():
+            for v in page.get("Volumes", []):
+                if v.get("State") == "deleted":
+                    continue
+                size_gb = v.get("Size", 0)
+                vtype = v.get("VolumeType", "gp2")
+                cost = _EBS_GB_MONTH.get(vtype, 0.08) * size_gb
+                name = _name_from_tags(v.get("Tags")) or v["VolumeId"]
+                attached = [a["InstanceId"] for a in v.get("Attachments", [])]
+                state = v.get("State", "")
+                results.append({
+                    "resource_type": "ebs_volume",
+                    "resource_id": v["VolumeId"],
+                    "name": name,
+                    "arn": f"arn:aws:ec2:{region}::volume/{v['VolumeId']}",
+                    "state": state,
+                    "region": region,
+                    "created_at": _iso_str(v.get("CreateTime")),
+                    "size_hint": f"{size_gb} GB / {vtype}" + ("" if attached else " / unattached"),
+                    "estimated_monthly_usd": round(cost, 2),
+                    "tags": _tags_to_list(v.get("Tags")),
+                })
+    except Exception:  # nosec B110
+        pass
+    return results
+
+
+def _fetch_rds_resources(session: boto3.Session, region: str) -> list[dict]:
+    rds = session.client("rds", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    _skip = {"creating", "deleting", "deleted", "failed", "incompatible-parameters"}
+
+    try:
+        paginator = rds.get_paginator("describe_db_instances")
+        for page in paginator.paginate():
+            for db in page.get("DBInstances", []):
+                state = db.get("DBInstanceStatus", "")
+                if state in _skip:
+                    continue
+                cls = db.get("DBInstanceClass", "")
+                storage_gb = db.get("AllocatedStorage", 0)
+                multi_az = db.get("MultiAZ", False)
+                hourly = _RDS_HOURLY.get(cls, 0.10) * (2 if multi_az else 1)
+                cost = (hourly * _HOURS_PER_MONTH) + (storage_gb * _RDS_STORAGE_GB_MONTH)
+                engine = db.get("Engine", "")
+                results.append({
+                    "resource_type": "rds_instance",
+                    "resource_id": db["DBInstanceIdentifier"],
+                    "name": db["DBInstanceIdentifier"],
+                    "arn": db.get("DBInstanceArn"),
+                    "state": state,
+                    "region": region,
+                    "created_at": _iso_str(db.get("InstanceCreateTime")),
+                    "size_hint": f"{cls} / {storage_gb} GB{' / Multi-AZ' if multi_az else ''} / {engine}",
+                    "estimated_monthly_usd": round(cost, 2),
+                    "tags": _tags_to_list(db.get("TagList")),
+                })
+    except Exception:  # nosec B110
+        pass
+
+    try:
+        paginator = rds.get_paginator("describe_db_clusters")
+        for page in paginator.paginate():
+            for cluster in page.get("DBClusters", []):
+                state = cluster.get("Status", "")
+                if state in _skip:
+                    continue
+                members = len(cluster.get("DBClusterMembers", []))
+                hourly = _RDS_HOURLY.get("db.r5.large", 0.24) * max(members, 1)
+                cost = hourly * _HOURS_PER_MONTH
+                engine = cluster.get("Engine", "aurora")
+                results.append({
+                    "resource_type": "aurora_cluster",
+                    "resource_id": cluster["DBClusterIdentifier"],
+                    "name": cluster["DBClusterIdentifier"],
+                    "arn": cluster.get("DBClusterArn"),
+                    "state": state,
+                    "region": region,
+                    "created_at": _iso_str(cluster.get("ClusterCreateTime")),
+                    "size_hint": f"{members} node{'s' if members != 1 else ''} / {engine}",
+                    "estimated_monthly_usd": round(cost, 2),
+                    "tags": _tags_to_list(cluster.get("TagList")),
+                })
+    except Exception:  # nosec B110
+        pass
+
+    return results
+
+
+def _fetch_nat_gateways(session: boto3.Session, region: str) -> list[dict]:
+    ec2 = session.client("ec2", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    try:
+        paginator = ec2.get_paginator("describe_nat_gateways")
+        for page in paginator.paginate(Filter=[{"Name": "state", "Values": ["available"]}]):
+            for gw in page.get("NatGateways", []):
+                name = _name_from_tags(gw.get("Tags")) or gw["NatGatewayId"]
+                results.append({
+                    "resource_type": "nat_gateway",
+                    "resource_id": gw["NatGatewayId"],
+                    "name": name,
+                    "arn": None,
+                    "state": gw.get("State", "available"),
+                    "region": region,
+                    "created_at": _iso_str(gw.get("CreateTime")),
+                    "size_hint": gw.get("SubnetId", ""),
+                    "estimated_monthly_usd": round(_NAT_GW_HOURLY * _HOURS_PER_MONTH, 2),
+                    "tags": _tags_to_list(gw.get("Tags")),
+                })
+    except Exception:  # nosec B110
+        pass
+    return results
+
+
+def _fetch_load_balancers(session: boto3.Session, region: str) -> list[dict]:
+    elbv2 = session.client("elbv2", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    try:
+        paginator = elbv2.get_paginator("describe_load_balancers")
+        for page in paginator.paginate():
+            for lb in page.get("LoadBalancers", []):
+                state_code = lb.get("State", {}).get("Code", "")
+                if state_code not in ("active", "provisioning"):
+                    continue
+                lb_type = lb.get("Type", "application").upper()
+                results.append({
+                    "resource_type": "load_balancer",
+                    "resource_id": lb["LoadBalancerName"],
+                    "name": lb["LoadBalancerName"],
+                    "arn": lb.get("LoadBalancerArn"),
+                    "state": state_code,
+                    "region": region,
+                    "created_at": _iso_str(lb.get("CreatedTime")),
+                    "size_hint": lb_type,
+                    "estimated_monthly_usd": round(_ELB_HOURLY * _HOURS_PER_MONTH, 2),
+                    "tags": [],
+                })
+    except Exception:  # nosec B110
+        pass
+    return results
+
+
+def _fetch_elastic_ips(session: boto3.Session, region: str) -> list[dict]:
+    ec2 = session.client("ec2", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    try:
+        for addr in ec2.describe_addresses().get("Addresses", []):
+            if addr.get("NetworkInterfaceId") or addr.get("AssociationId"):
+                continue  # attached — not charged
+            name = _name_from_tags(addr.get("Tags")) or addr.get("PublicIp", "")
+            results.append({
+                "resource_type": "elastic_ip",
+                "resource_id": addr.get("AllocationId") or addr.get("PublicIp", ""),
+                "name": name,
+                "arn": None,
+                "state": "unattached",
+                "region": region,
+                "created_at": None,
+                "size_hint": addr.get("PublicIp", ""),
+                "estimated_monthly_usd": round(_EIP_HOURLY * _HOURS_PER_MONTH, 2),
+                "tags": _tags_to_list(addr.get("Tags")),
+            })
+    except Exception:  # nosec B110
+        pass
+    return results
+
+
+def _fetch_snapshots(session: boto3.Session, region: str) -> list[dict]:
+    ec2 = session.client("ec2", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    try:
+        paginator = ec2.get_paginator("describe_snapshots")
+        for page in paginator.paginate(OwnerIds=["self"]):
+            for snap in page.get("Snapshots", []):
+                if snap.get("State") not in ("completed", "pending"):
+                    continue
+                size_gb = snap.get("VolumeSize", 0)
+                raw_name = _name_from_tags(snap.get("Tags")) or snap.get("Description") or snap["SnapshotId"]
+                name = raw_name[:57] + "…" if len(raw_name) > 60 else raw_name
+                results.append({
+                    "resource_type": "ebs_snapshot",
+                    "resource_id": snap["SnapshotId"],
+                    "name": name,
+                    "arn": None,
+                    "state": snap.get("State", "completed"),
+                    "region": region,
+                    "created_at": _iso_str(snap.get("StartTime")),
+                    "size_hint": f"{size_gb} GB",
+                    "estimated_monthly_usd": round(size_gb * _SNAPSHOT_GB_MONTH, 2),
+                    "tags": _tags_to_list(snap.get("Tags")),
+                })
+    except Exception:  # nosec B110
+        pass
+    return results
+
+
+def _fetch_elasticache_resources(session: boto3.Session, region: str) -> list[dict]:
+    ec = session.client("elasticache", region_name=region, config=_BOTO_CONFIG)
+    results: list[dict] = []
+    try:
+        paginator = ec.get_paginator("describe_cache_clusters")
+        for page in paginator.paginate():
+            for cluster in page.get("CacheClusters", []):
+                state = cluster.get("CacheClusterStatus", "")
+                if state not in ("available", "modifying"):
+                    continue
+                node_type = cluster.get("CacheNodeType", "")
+                num_nodes = cluster.get("NumCacheNodes", 1)
+                hourly = _ELASTICACHE_HOURLY.get(node_type, 0.05) * num_nodes
+                engine = cluster.get("Engine", "")
+                cluster_id = cluster.get("CacheClusterId", "")
+                results.append({
+                    "resource_type": "elasticache",
+                    "resource_id": cluster_id,
+                    "name": cluster_id,
+                    "arn": cluster.get("ARN"),
+                    "state": state,
+                    "region": region,
+                    "created_at": _iso_str(cluster.get("CacheClusterCreateTime")),
+                    "size_hint": f"{node_type} × {num_nodes} / {engine}",
+                    "estimated_monthly_usd": round(hourly * _HOURS_PER_MONTH, 2),
+                    "tags": [],
+                })
+    except Exception:  # nosec B110
+        pass
+    return results
+
+
+async def list_cost_resources(region: str, creds: Credentials | None) -> list[dict]:
+    """Return all billable resources in a region with cost estimates, sorted by cost descending.
+
+    Each service fetcher catches its own exceptions so one missing IAM permission
+    does not prevent other services from returning results.
+    """
+    session = _make_session(creds)
+    loop = asyncio.get_event_loop()
+
+    tasks = [
+        loop.run_in_executor(_executor, fn, session, region)
+        for fn in (
+            _fetch_ec2_cost_items,
+            _fetch_ebs_cost_items,
+            _fetch_rds_resources,
+            _fetch_nat_gateways,
+            _fetch_load_balancers,
+            _fetch_elastic_ips,
+            _fetch_snapshots,
+            _fetch_elasticache_resources,
+        )
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    resources: list[dict] = []
+    for r in results:
+        if not isinstance(r, Exception):
+            resources.extend(r)
+    resources.sort(key=lambda r: r["estimated_monthly_usd"], reverse=True)
+    return resources
+
+
 class CredentialsError(Exception):
     pass
 

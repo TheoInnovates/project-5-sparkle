@@ -63,3 +63,16 @@ export interface Config {
 	default_region: string;
 	env_creds_configured: boolean;
 }
+
+export interface CostResource {
+	resource_type: string;
+	resource_id: string;
+	name: string;
+	arn: string | null;
+	state: string;
+	region: string;
+	created_at: string | null;
+	size_hint: string | null;
+	estimated_monthly_usd: number;
+	tags: { Key: string; Value: string }[];
+}
