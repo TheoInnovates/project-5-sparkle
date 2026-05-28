@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from sparkle.aws import (
+from vantage.aws import (
     AWSError, Credentials, CredentialsError,
     InstanceEvent, InstanceRecord,
     fetch_s3_events, list_cost_resources, list_events, list_instances, list_regions,
@@ -24,11 +24,11 @@ load_dotenv()
 
 FRONTEND_BUILD = Path(__file__).parent.parent.parent / "frontend" / "build"
 
-app = FastAPI(title="Sparkle", version="0.1.0", docs_url="/api/docs")
+app = FastAPI(title="Vantage", version="0.1.0", docs_url="/api/docs")
 
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
-if os.getenv("SPARKLE_DEV"):
+if os.getenv("VANTAGE_DEV"):
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173"],
@@ -402,4 +402,4 @@ if FRONTEND_BUILD.exists():
 else:
     @app.get("/")
     def root():
-        return {"message": "Sparkle API running. Frontend not built yet — run: cd frontend && pnpm build"}
+        return {"message": "Vantage API running. Frontend not built yet — run: cd frontend && pnpm build"}

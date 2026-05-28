@@ -1,4 +1,4 @@
-"""CLI entry point: sparkle serve | sparkle list"""
+"""CLI entry point: vantage serve | vantage list"""
 from __future__ import annotations
 
 import argparse
@@ -19,11 +19,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
         print("uvicorn not installed. Run: uv sync --extra server", file=sys.stderr)
         sys.exit(1)
 
-    host = args.host or os.getenv("SPARKLE_HOST", "0.0.0.0")  # nosec B104 — intentional, user-configurable
-    port = args.port or int(os.getenv("SPARKLE_PORT", "8000"))
-    print(f"Sparkle → http://{host}:{port}")
+    host = args.host or os.getenv("VANTAGE_HOST", "0.0.0.0")  # nosec B104 — intentional, user-configurable
+    port = args.port or int(os.getenv("VANTAGE_PORT", "8000"))
+    print(f"Vantage → http://{host}:{port}")
     uvicorn.run(
-        "sparkle.server.app:app",
+        "vantage.server.app:app",
         host=host,
         port=port,
         reload=args.reload,
@@ -31,7 +31,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    from sparkle.aws import AWSError, CredentialsError, list_instances
+    from vantage.aws import AWSError, CredentialsError, list_instances
 
     async def _run():
         try:
@@ -97,7 +97,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="sparkle", description="AWS EC2 instance viewer")
+    parser = argparse.ArgumentParser(prog="vantage", description="AWS EC2 instance viewer")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve_p = sub.add_parser("serve", help="Start the web server")

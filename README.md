@@ -1,4 +1,4 @@
-# Sparkle
+# Vantage
 
 AWS EC2 instance viewer — see every instance in an account and region along with who launched it and when, sourced from CloudTrail.
 
@@ -47,7 +47,7 @@ AWS credentials are optional in `.env`; the server will fall back to the boto3 d
 
 ```bash
 uv sync --extra server
-uv run sparkle serve
+uv run vantage serve
 ```
 
 Open [http://localhost:8000](http://localhost:8000).
@@ -76,13 +76,13 @@ The region can also be changed at any time from the toolbar dropdown without ope
 
 ```bash
 # Formatted table
-uv run sparkle list --region us-east-1
+uv run vantage list --region us-east-1
 
 # Raw JSON
-uv run sparkle list --region eu-west-1 --json
+uv run vantage list --region eu-west-1 --json
 
 # Custom host/port
-uv run sparkle serve --host 127.0.0.1 --port 9000 --reload
+uv run vantage serve --host 127.0.0.1 --port 9000 --reload
 ```
 
 ## Required IAM permissions
@@ -104,7 +104,7 @@ uv run sparkle serve --host 127.0.0.1 --port 9000 --reload
 ```bash
 # Backend (auto-reload on save)
 uv sync --extra server
-SPARKLE_DEV=1 uv run sparkle serve --reload
+VANTAGE_DEV=1 uv run vantage serve --reload
 
 # Frontend (separate terminal — Vite proxies /api to :8000)
 cd frontend
@@ -151,6 +151,6 @@ GitHub Actions runs six jobs on every push and pull request:
 | `AWS_ACCESS_KEY_ID` | — | Optional — enables the `.env file` credential source in the UI |
 | `AWS_SECRET_ACCESS_KEY` | — | Required alongside `AWS_ACCESS_KEY_ID` |
 | `AWS_SESSION_TOKEN` | — | Optional session token for temporary credentials |
-| `SPARKLE_HOST` | `0.0.0.0` | Bind address |
-| `SPARKLE_PORT` | `8000` | Bind port |
-| `SPARKLE_DEV` | — | Set to `1` to enable CORS (needed for Vite dev server) |
+| `VANTAGE_HOST` | `0.0.0.0` | Bind address |
+| `VANTAGE_PORT` | `8000` | Bind port |
+| `VANTAGE_DEV` | — | Set to `1` to enable CORS (needed for Vite dev server) |

@@ -1,6 +1,6 @@
-# project-5-sparkle
+# project-5-sparkle (Vantage)
 
-AWS EC2 instance viewer: launch times, first-start history via CloudTrail, and IAM ownership.
+AWS resource viewer: EC2 instances, EBS volumes, cost inventory, CloudTrail events, and multi-region support.
 
 ## Stack
 
@@ -13,7 +13,7 @@ AWS EC2 instance viewer: launch times, first-start history via CloudTrail, and I
 ```bash
 uv sync --extra server
 cp .env.example .env   # add AWS creds
-uv run sparkle serve --reload
+VANTAGE_DEV=1 uv run vantage serve --reload
 
 # Frontend (separate terminal)
 cd frontend && pnpm install && pnpm dev
@@ -23,12 +23,12 @@ cd frontend && pnpm install && pnpm dev
 
 ```bash
 cd frontend && pnpm build
-uv run sparkle serve
+uv run vantage serve
 ```
 
 ## Commands
 
-- `uv run sparkle serve [--host H] [--port P] [--reload]`
-- `uv run sparkle list --region REGION [--json]`
+- `uv run vantage serve [--host H] [--port P] [--reload]`
+- `uv run vantage list --region REGION [--json]`
 - `uv run pytest`
 - `cd frontend && pnpm check`

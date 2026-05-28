@@ -1,6 +1,6 @@
 import type { Config, CostResource, CredConfig, EBSVolume, InstanceEvent, InstanceRecord, TagResource } from './types';
 
-const STORAGE_KEY = 'sparkle_cred_config';
+const STORAGE_KEY = 'vantage_cred_config';
 
 export function saveCredConfig(config: CredConfig): void {
 	sessionStorage.setItem(STORAGE_KEY, JSON.stringify(config));

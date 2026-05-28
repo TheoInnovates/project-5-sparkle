@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from sparkle.aws import AWSError, CredentialsError, InstanceEvent, InstanceRecord
-from sparkle.server.app import app
+from vantage.aws import AWSError, CredentialsError, InstanceEvent, InstanceRecord
+from vantage.server.app import app
 
 client = TestClient(app)
 
@@ -24,7 +24,7 @@ _sample_record = InstanceRecord(
 
 
 def test_get_instances_success():
-    with patch("sparkle.server.app.list_instances", new=AsyncMock(return_value=[_sample_record])):
+    with patch("vantage.server.app.list_instances", new=AsyncMock(return_value=[_sample_record])):
         r = client.get("/api/instances?region=us-east-1")
     assert r.status_code == 200
     data = r.json()
@@ -40,19 +40,19 @@ def test_get_instances_missing_region():
 
 
 def test_get_instances_credentials_error():
-    with patch("sparkle.server.app.list_instances", new=AsyncMock(side_effect=CredentialsError("no creds"))):
+    with patch("vantage.server.app.list_instances", new=AsyncMock(side_effect=CredentialsError("no creds"))):
         r = client.get("/api/instances?region=us-east-1")
     assert r.status_code == 503
 
 
 def test_get_instances_aws_error():
-    with patch("sparkle.server.app.list_instances", new=AsyncMock(side_effect=AWSError("invalid region"))):
+    with patch("vantage.server.app.list_instances", new=AsyncMock(side_effect=AWSError("invalid region"))):
         r = client.get("/api/instances?region=bad-region")
     assert r.status_code == 502
 
 
 def test_get_regions_success():
-    with patch("sparkle.server.app.list_regions", return_value=["us-east-1", "eu-west-1"]):
+    with patch("vantage.server.app.list_regions", return_value=["us-east-1", "eu-west-1"]):
         r = client.get("/api/regions")
     assert r.status_code == 200
     assert "us-east-1" in r.json()
@@ -74,7 +74,7 @@ def test_cred_source_manual():
         captured["creds"] = creds
         return [_sample_record]
 
-    with patch("sparkle.server.app.list_instances", new=mock_list):
+    with patch("vantage.server.app.list_instances", new=mock_list):
         r = client.get(
             "/api/instances?region=us-east-1",
             headers={
@@ -98,7 +98,7 @@ def test_cred_source_local():
         captured["creds"] = creds
         return []
 
-    with patch("sparkle.server.app.list_instances", new=mock_list):
+    with patch("vantage.server.app.list_instances", new=mock_list):
         r = client.get(
             "/api/instances?region=us-east-1",
             headers={"x-aws-cred-source": "local"},
@@ -117,7 +117,7 @@ def test_cred_source_env_configured(monkeypatch):
         captured["creds"] = creds
         return []
 
-    with patch("sparkle.server.app.list_instances", new=mock_list):
+    with patch("vantage.server.app.list_instances", new=mock_list):
         r = client.get(
             "/api/instances?region=us-east-1",
             headers={"x-aws-cred-source": "env"},
@@ -133,7 +133,7 @@ def test_cred_source_env_not_configured():
     # Ensure the vars are absent
     env_backup = {k: os.environ.pop(k, None) for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")}
     try:
-        with patch("sparkle.server.app.list_instances", new=AsyncMock(return_value=[])):
+        with patch("vantage.server.app.list_instances", new=AsyncMock(return_value=[])):
             r = client.get(
                 "/api/instances?region=us-east-1",
                 headers={"x-aws-cred-source": "env"},
@@ -153,7 +153,7 @@ def test_no_cred_source_header_defaults_to_local():
         captured["creds"] = creds
         return []
 
-    with patch("sparkle.server.app.list_instances", new=mock_list):
+    with patch("vantage.server.app.list_instances", new=mock_list):
         r = client.get("/api/instances?region=us-east-1")
     assert r.status_code == 200
     assert captured["creds"] is None
@@ -169,7 +169,7 @@ _sample_event = InstanceEvent(
 
 
 def test_get_events_success():
-    with patch("sparkle.server.app.list_events", new=AsyncMock(return_value=[_sample_event])):
+    with patch("vantage.server.app.list_events", new=AsyncMock(return_value=[_sample_event])):
         r = client.get("/api/events?region=us-east-1")
     assert r.status_code == 200
     data = r.json()
@@ -186,12 +186,12 @@ def test_get_events_missing_region():
 
 
 def test_get_events_credentials_error():
-    with patch("sparkle.server.app.list_events", new=AsyncMock(side_effect=CredentialsError("no creds"))):
+    with patch("vantage.server.app.list_events", new=AsyncMock(side_effect=CredentialsError("no creds"))):
         r = client.get("/api/events?region=us-east-1")
     assert r.status_code == 503
 
 
 def test_get_events_aws_error():
-    with patch("sparkle.server.app.list_events", new=AsyncMock(side_effect=AWSError("bad region"))):
+    with patch("vantage.server.app.list_events", new=AsyncMock(side_effect=AWSError("bad region"))):
         r = client.get("/api/events?region=bad-region")
     assert r.status_code == 502

@@ -570,7 +570,7 @@
 		// Raw CloudTrail S3 format: { Records: [...] }
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const records: any[] = parsed?.Records ?? (Array.isArray(parsed) ? parsed : null);
-		if (!records) throw new Error('Unrecognised format — expected { Records: [...] } or Sparkle JSON export');
+		if (!records) throw new Error('Unrecognised format — expected { Records: [...] } or Vantage JSON export');
 
 		const result: InstanceEvent[] = [];
 		for (const rec of records) {
@@ -814,7 +814,7 @@
 		}));
 		triggerDownload(
 			new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
-			`sparkle-timeline-${region}-${today()}.json`
+			`vantage-timeline-${region}-${today()}.json`
 		);
 	}
 
@@ -824,7 +824,7 @@
 			rows.push([e.event_time, e.event_name, e.instance_id, instanceNameMap[e.instance_id] ?? e.instance_id, e.username ?? '', e.source_ip ?? '']);
 		}
 		const csv = rows.map(r => r.map(c => `"${c.replace(/"/g, '""')}"`).join(',')).join('\n');
-		triggerDownload(new Blob([csv], { type: 'text/csv' }), `sparkle-timeline-${region}-${today()}.csv`);
+		triggerDownload(new Blob([csv], { type: 'text/csv' }), `vantage-timeline-${region}-${today()}.csv`);
 	}
 
 	function exportInstancesCSV() {
@@ -840,7 +840,7 @@
 			]);
 		}
 		const csv = rows.map(r => r.map(c => `"${c.replace(/"/g, '""')}"`).join(',')).join('\n');
-		triggerDownload(new Blob([csv], { type: 'text/csv' }), `sparkle-instances-${region}-${today()}.csv`);
+		triggerDownload(new Blob([csv], { type: 'text/csv' }), `vantage-instances-${region}-${today()}.csv`);
 	}
 
 	async function exportInstancesExcel() {
@@ -849,7 +849,7 @@
 
 		// Sheet 1 — Summary
 		const summaryRows = [
-			['Sparkle — Instance Report'],
+			['Vantage — Instance Report'],
 			['Region', region],
 			['Generated', new Date().toLocaleString()],
 			[],
@@ -887,7 +887,7 @@
 			XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([evtHeaders, ...evtRows]), 'Events');
 		}
 
-		XLSX.writeFile(wb, `sparkle-report-${region}-${today()}.xlsx`);
+		XLSX.writeFile(wb, `vantage-report-${region}-${today()}.xlsx`);
 	}
 
 	async function exportInstancesPDF() {
@@ -899,7 +899,7 @@
 
 		// Header
 		doc.setFontSize(16); doc.setTextColor(30);
-		doc.text('Sparkle — Instance Report', 14, 15);
+		doc.text('Vantage — Instance Report', 14, 15);
 		doc.setFontSize(9); doc.setTextColor(100);
 		doc.text(`Region: ${region}`, 14, 21);
 		doc.text(`Generated: ${new Date().toLocaleString()}`, 14, 26);
@@ -959,7 +959,7 @@
 			});
 		}
 
-		doc.save(`sparkle-report-${region}-${today()}.pdf`);
+		doc.save(`vantage-report-${region}-${today()}.pdf`);
 	}
 
 	function triggerDownload(blob: Blob, filename: string) {
@@ -982,7 +982,7 @@
 		// Start loading instances right away — don't block on regions/config fetch
 		loadInstances();
 		startAutoRefresh();
-		window.addEventListener('sparkle:credentials-saved', onCredentialsSaved);
+		window.addEventListener('vantage:credentials-saved', onCredentialsSaved);
 
 		// Populate region dropdown and server-default region in the background
 		getConfig()
@@ -999,7 +999,7 @@
 
 	onDestroy(() => {
 		stopAutoRefresh();
-		window.removeEventListener('sparkle:credentials-saved', onCredentialsSaved);
+		window.removeEventListener('vantage:credentials-saved', onCredentialsSaved);
 	});
 
 	// ── Gantt chart ───────────────────────────────────────────────────────────
