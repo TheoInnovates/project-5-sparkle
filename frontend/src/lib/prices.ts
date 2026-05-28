@@ -1,5 +1,46 @@
+// Regional price multipliers relative to us-east-1.
+// Source: AWS public pricing pages. Shown as estimates only.
+export const REGION_PRICE_MULTIPLIER: Record<string, number> = {
+	'us-east-1':      1.000,
+	'us-east-2':      1.000,
+	'us-west-1':      1.057,
+	'us-west-2':      1.000,
+	'ca-central-1':   1.070,
+	'ca-west-1':      1.090,
+	'eu-west-1':      1.090,
+	'eu-west-2':      1.117,
+	'eu-west-3':      1.126,
+	'eu-central-1':   1.117,
+	'eu-central-2':   1.150,
+	'eu-north-1':     1.070,
+	'eu-south-1':     1.110,
+	'eu-south-2':     1.130,
+	'ap-east-1':      1.160,
+	'ap-southeast-1': 1.098,
+	'ap-southeast-2': 1.114,
+	'ap-southeast-3': 1.120,
+	'ap-southeast-4': 1.120,
+	'ap-northeast-1': 1.140,
+	'ap-northeast-2': 1.070,
+	'ap-northeast-3': 1.140,
+	'ap-south-1':     1.070,
+	'ap-south-2':     1.110,
+	'sa-east-1':      1.150,
+	'me-south-1':     1.175,
+	'me-central-1':   1.150,
+	'af-south-1':     1.160,
+	'il-central-1':   1.160,
+	'us-gov-east-1':  1.150,
+	'us-gov-west-1':  1.150,
+};
+
+export function regionMultiplier(region?: string): number {
+	if (!region) return 1;
+	return REGION_PRICE_MULTIPLIER[region] ?? 1;
+}
+
 // Approximate on-demand Linux $/hr — us-east-1 base prices.
-// Prices vary by region (~10-20%) and purchase model. Shown as estimates only.
+// Use estimateInstanceCostPerMonth(type, region) for region-adjusted values.
 export const EC2_PRICE: Record<string, number> = {
 	// T3 (burstable)
 	't3.nano': 0.0052, 't3.micro': 0.0104, 't3.small': 0.0208,
@@ -44,18 +85,19 @@ export const EBS_PRICE: Record<string, number> = {
 	'standard': 0.05,
 };
 
-export function estimateInstanceCostPerHour(type: string): number | null {
-	return EC2_PRICE[type] ?? null;
+export function estimateInstanceCostPerHour(type: string, region?: string): number | null {
+	const base = EC2_PRICE[type];
+	return base != null ? base * regionMultiplier(region) : null;
 }
 
-export function estimateInstanceCostPerMonth(type: string): number | null {
-	const rate = EC2_PRICE[type];
+export function estimateInstanceCostPerMonth(type: string, region?: string): number | null {
+	const rate = estimateInstanceCostPerHour(type, region);
 	return rate != null ? rate * 730 : null;
 }
 
-export function estimateEBSCostPerMonth(volumeType: string, sizeGb: number): number {
-	const rate = EBS_PRICE[volumeType] ?? 0.08;
-	return rate * sizeGb;
+export function estimateEBSCostPerMonth(volumeType: string, sizeGb: number, region?: string): number {
+	const base = EBS_PRICE[volumeType] ?? 0.08;
+	return base * sizeGb * regionMultiplier(region);
 }
 
 export function fmtCost(dollars: number): string {

@@ -206,8 +206,9 @@
 	function stateColor(s: string): string { return STATE_COLORS[s] ?? '#71717a'; }
 	function eventColor(n: string): string { return EVENT_COLORS[n] ?? '#71717a'; }
 
-	function instanceLifetimeCost(inst: { instance_type: string; state: string; launch_time: string; last_stopped?: string | null; last_terminated?: string | null }): number | null {
-		const monthly = estimateInstanceCostPerMonth(inst.instance_type);
+	function instanceLifetimeCost(inst: { instance_type: string; state: string; launch_time: string; last_stopped?: string | null; last_terminated?: string | null; region?: string }): number | null {
+		const instRegion = inst.region ?? region;
+		const monthly = estimateInstanceCostPerMonth(inst.instance_type, instRegion);
 		if (monthly == null) return null;
 		const hourlyRate = monthly / 730;
 		const startMs = new Date(inst.launch_time).getTime();
@@ -351,7 +352,7 @@
 	const runningEstimatedCost = $derived(
 		enrichedInstances
 			.filter(i => i.state === 'running')
-			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type) ?? 0), 0)
+			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type, i.region ?? region) ?? 0), 0)
 	);
 
 	function toggleStateFilter(s: string) {
@@ -456,11 +457,11 @@
 	const estimatedMonthlyCost = $derived(
 		sortedInstances
 			.filter(i => i.state === 'running')
-			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type) ?? 0), 0)
+			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type, i.region ?? region) ?? 0), 0)
 	);
 
 	const unattachedEBSWaste = $derived(
-		unattachedVolumes.reduce((sum, v) => sum + estimateEBSCostPerMonth(v.volume_type, v.size_gb), 0)
+		unattachedVolumes.reduce((sum, v) => sum + estimateEBSCostPerMonth(v.volume_type, v.size_gb, region), 0)
 	);
 
 	// ── Tag compliance per instance ───────────────────────────────────────────
@@ -1691,7 +1692,7 @@
 							{#each volumes as v}
 								{@const isWaste = v.state === 'available'}
 								{@const ageDays = Math.floor((Date.now() - new Date(v.create_time).getTime()) / 86400000)}
-								{@const cost = estimateEBSCostPerMonth(v.volume_type, v.size_gb)}
+								{@const cost = estimateEBSCostPerMonth(v.volume_type, v.size_gb, region)}
 								{@const isVolExpanded = expandedVolumeId === v.volume_id}
 								<tr
 									class="cursor-pointer transition-colors"
@@ -1901,10 +1902,11 @@
 								{#if effectiveVisibleCols.has('vpc')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.vpc_id ?? '—'}</td>{/if}
 								{#if effectiveVisibleCols.has('iam')}<td class="px-4 py-3 font-mono text-xs truncate max-w-xs" style="color: var(--color-muted);" title={inst.iam_profile ?? ''}>{inst.iam_profile ? shortUsername(inst.iam_profile) : '—'}</td>{/if}
 							{#if effectiveVisibleCols.has('cost')}
+							{@const instRegion = inst.region ?? region}
 							{@const ltCost = instanceLifetimeCost(inst)}
 							<td class="px-4 py-3 text-xs whitespace-nowrap" style="color: var(--color-muted);">
 								{#if inst.state === 'running'}
-									<span title="Approximate on-demand Linux price, us-east-1">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type) ?? 0)}/mo</span>
+									<span title="Approximate on-demand Linux price, {instRegion}">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type, instRegion) ?? 0)}/mo</span>
 								{:else if inst.state === 'stopped'}
 									<span style="color: #eab308;" title="Stopped: no compute cost but EBS storage still billed">EBS only</span>
 								{:else}
@@ -1986,6 +1988,7 @@
 
 										<!-- Lifetime Cost -->
 										{#if instanceLifetimeCost(inst) != null}
+										{@const instRegion = inst.region ?? region}
 										<div class="border-t pt-3 mb-4" style="border-color: var(--color-border);">
 											<p class="text-xs font-semibold uppercase tracking-widest mb-2" style="color: var(--color-muted);">COST</p>
 											<div class="flex items-end gap-6 text-xs">
@@ -1993,9 +1996,9 @@
 													<p class="text-xl font-bold tracking-tight">~{fmtCost(instanceLifetimeCost(inst)!)}</p>
 													<p class="mt-0.5" style="color: var(--color-muted);">estimated lifetime total</p>
 												</div>
-												{#if estimateInstanceCostPerMonth(inst.instance_type) != null}
+												{#if estimateInstanceCostPerMonth(inst.instance_type, instRegion) != null}
 												<div style="color: var(--color-muted);">
-													<p class="font-medium" style="color: var(--color-text-secondary);">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type)!)}/mo</p>
+													<p class="font-medium" style="color: var(--color-text-secondary);">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type, instRegion)!)}/mo</p>
 													<p class="mt-0.5">on-demand rate</p>
 												</div>
 												{/if}
@@ -2010,8 +2013,8 @@
 													<p class="mt-0.5">since launch</p>
 												</div>
 											</div>
-											<p class="mt-2 text-xs" style="color: var(--color-muted);" title="Assumes continuous running at on-demand Linux us-east-1 price">
-												Assumes continuous running · on-demand Linux us-east-1
+											<p class="mt-2 text-xs" style="color: var(--color-muted);" title="Approximate on-demand Linux price for {instRegion}">
+												Approximate on-demand Linux · {instRegion}
 											</p>
 										</div>
 										{/if}
