@@ -299,8 +299,7 @@
 				if (!inst.name.toLowerCase().includes(q) && !inst.instance_id.toLowerCase().includes(q)) return false;
 			}
 			if (filterStates.size > 0) {
-				const matchesOther = filterStates.has('other') && !STD_STATES.includes(inst.state);
-				if (!filterStates.has(inst.state) && !matchesOther) return false;
+				if (!filterStates.has(inst.state)) return false;
 			}
 			if (filterType && inst.instance_type !== filterType) return false;
 			if (filterAZ && inst.availability_zone !== filterAZ) return false;
@@ -321,8 +320,15 @@
 		other: enrichedInstances.filter(i => !STD_STATES.includes(i.state)).length,
 	});
 
-	const transitionalStateNames = $derived(
-		[...new Set(enrichedInstances.filter(i => !STD_STATES.includes(i.state)).map(i => i.state))].join(', ')
+	const transitionalCards = $derived(
+		[...new Set(enrichedInstances.filter(i => !STD_STATES.includes(i.state)).map(i => i.state))]
+			.sort()
+			.map(state => ({
+				state,
+				label: state.charAt(0).toUpperCase() + state.slice(1),
+				count: enrichedInstances.filter(i => i.state === state).length,
+				color: stateColor(state),
+			}))
 	);
 
 	const runningEstimatedCost = $derived(
@@ -473,11 +479,10 @@
 		tlFilterEvents = next;
 	}
 
-	const STAT_CARDS: Array<{ state: keyof typeof stateCounts | 'other'; label: string; color: string; icon: string; }> = [
+	const STAT_CARDS: Array<{ state: keyof typeof stateCounts; label: string; color: string; icon: string; }> = [
 		{ state: 'running',    label: 'Running',    color: '#22c55e', icon: 'M5 3l14 9-14 9V3z' },
 		{ state: 'stopped',    label: 'Stopped',    color: '#eab308', icon: 'M6 4h4v16H6zM14 4h4v16h-4z' },
 		{ state: 'terminated', label: 'Terminated', color: '#ef4444', icon: 'M18.364 18.364A9 9 0 0 0 5.636 5.636m12.728 12.728A9 9 0 0 1 5.636 5.636m12.728 12.728L5.636 5.636' },
-		{ state: 'other',      label: 'Other',      color: '#71717a', icon: 'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0M12 8v4M12 16h.01' },
 	];
 
 	const TABS: Array<{ id: 'instances'|'timeline'|'lifetime'|'resources'; label: string; icon: string; }> = [
@@ -1586,11 +1591,28 @@
 							<p class="text-xs mt-1" style="color: var(--color-muted);">~{fmtCost(runningEstimatedCost)}/mo</p>
 						{:else if card.state === 'stopped' && count > 0}
 							<p class="text-xs mt-1" style="color: var(--color-muted);">EBS costs</p>
-						{:else if card.state === 'other' && transitionalStateNames}
-							<p class="text-xs mt-1 truncate" style="color: var(--color-muted);">{transitionalStateNames}</p>
 						{/if}
 					</button>
 				{/if}
+			{/each}
+			<!-- Dynamic transitional state cards (one per distinct state) -->
+			{#each transitionalCards as card}
+				{@const active = filterStates.has(card.state)}
+				<button
+					onclick={() => toggleStateFilter(card.state)}
+					class="rounded-xl p-4 border text-left transition-all"
+					style="background-color: {active ? card.color + '18' : 'var(--color-surface)'}; border-color: {active ? card.color + '66' : 'var(--color-border)'};"
+					onmouseenter={(e) => { if (!active) (e.currentTarget as HTMLElement).style.borderColor = card.color + '55'; }}
+					onmouseleave={(e) => { if (!active) (e.currentTarget as HTMLElement).style.borderColor = active ? card.color + '66' : 'var(--color-border)'; }}
+				>
+					<div class="flex items-start justify-between mb-2">
+						<span class="text-xs font-semibold uppercase tracking-wide" style="color: {card.color};">{card.label}</span>
+						<!-- Transition/spinner icon -->
+						<svg class="w-4 h-4 shrink-0" style="color: {card.color}; opacity: 0.7;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+					</div>
+					<p class="text-2xl font-bold tracking-tight">{card.count}</p>
+					<p class="text-xs mt-1" style="color: var(--color-muted);">transitioning</p>
+				</button>
 			{/each}
 			<!-- Total card -->
 			<div class="rounded-xl p-4 border" style="background-color: var(--color-surface); border-color: var(--color-border);">
