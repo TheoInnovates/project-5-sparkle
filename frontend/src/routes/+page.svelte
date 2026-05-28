@@ -316,6 +316,12 @@
 		other: enrichedInstances.filter(i => !['running','stopped','terminated'].includes(i.state)).length,
 	});
 
+	const runningEstimatedCost = $derived(
+		enrichedInstances
+			.filter(i => i.state === 'running')
+			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type) ?? 0), 0)
+	);
+
 	function toggleStateFilter(s: string) {
 		const next = new Set(filterStates);
 		next.has(s) ? next.delete(s) : next.add(s);
@@ -457,6 +463,20 @@
 		next.has(name) ? next.delete(name) : next.add(name);
 		tlFilterEvents = next;
 	}
+
+	const STAT_CARDS: Array<{ state: keyof typeof stateCounts | 'other'; label: string; color: string; icon: string; }> = [
+		{ state: 'running',    label: 'Running',    color: '#22c55e', icon: 'M5 3l14 9-14 9V3z' },
+		{ state: 'stopped',    label: 'Stopped',    color: '#eab308', icon: 'M6 4h4v16H6zM14 4h4v16h-4z' },
+		{ state: 'terminated', label: 'Terminated', color: '#ef4444', icon: 'M18.364 18.364A9 9 0 0 0 5.636 5.636m12.728 12.728A9 9 0 0 1 5.636 5.636m12.728 12.728L5.636 5.636' },
+		{ state: 'other',      label: 'Other',      color: '#71717a', icon: 'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0M12 8v4M12 16h.01' },
+	];
+
+	const TABS: Array<{ id: 'instances'|'timeline'|'lifetime'|'resources'; label: string; icon: string; }> = [
+		{ id: 'instances', label: 'Instances', icon: 'M3 12h18M3 6h18M3 18h18' },
+		{ id: 'timeline', label: 'Timeline', icon: 'M12 3a9 9 0 1 0 0 18A9 9 0 0 0 12 3zM12 7v5l3.5 2' },
+		{ id: 'lifetime', label: 'Lifetime', icon: 'M3 20V14h4V20H3zM10 20V9h4V20H10zM17 20V4h4V20H17z' },
+		{ id: 'resources', label: 'Resources', icon: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17.93V18h-2v1.93C7.06 19.44 4.56 16.94 4.07 14H6v-2H4.07C4.56 9.06 7.06 6.56 10 6.07V8h2V6.07c2.94.49 5.44 2.99 5.93 5.93H16v2h1.93c-.49 2.94-2.99 5.44-5.93 5.93z' },
+	];
 
 	function jumpToTimeline(instanceId: string) {
 		tlFilterInstanceId = instanceId;
@@ -1205,7 +1225,7 @@
 		<button
 			onclick={() => loadInstances()}
 			disabled={loading || refreshing}
-			class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
+			class="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
 			style="background-color: var(--color-accent); color: white;"
 		>
 			{#if refreshing}
@@ -1219,11 +1239,12 @@
 			<span style="color: var(--color-muted);">Auto-refresh (30s)</span>
 		</label>
 
+		<div class="w-px h-5 self-center shrink-0" style="background-color: var(--color-border);"></div>
 		<!-- Column picker -->
 		<div class="relative">
 			<button
 				onclick={() => colPickerOpen = !colPickerOpen}
-				class="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium border transition-colors"
+				class="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium border transition-colors"
 				style="border-color: {colPickerOpen ? 'var(--color-accent)' : 'var(--color-border)'}; color: var(--color-text);"
 				title="Show/hide columns"
 			>
@@ -1380,7 +1401,7 @@
 					</div>
 
 					{#if s3Error}
-						<p class="text-xs mb-3 rounded px-2 py-1.5" style="background-color: #1f0a0a; color: #fca5a5;">{s3Error}</p>
+						<p class="text-xs mb-3 rounded px-2 py-1.5" style="background-color: var(--color-error-bg); color: var(--color-error-text);">{s3Error}</p>
 					{/if}
 
 					<div class="flex gap-2">
@@ -1469,41 +1490,25 @@
 </div>
 
 <!-- Tab bar -->
-<div class="flex gap-0 mt-4 mb-5 border-b" style="border-color: var(--color-border);">
-	<button
-		onclick={() => switchTab('instances')}
-		class="px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors"
-		style="border-color: {activeTab === 'instances' ? 'var(--color-accent)' : 'transparent'}; color: {activeTab === 'instances' ? 'var(--color-text)' : 'var(--color-muted)'};"
-	>
-		Instances
-	</button>
-	<button
-		onclick={() => switchTab('timeline')}
-		class="px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors"
-		style="border-color: {activeTab === 'timeline' ? 'var(--color-accent)' : 'transparent'}; color: {activeTab === 'timeline' ? 'var(--color-text)' : 'var(--color-muted)'};"
-	>
-		Timeline{#if importSource === 'file'} <span class="ml-1 w-1.5 h-1.5 rounded-full inline-block" style="background-color: #6366f1; vertical-align: middle;"></span>{/if}
-	</button>
-	<button
-		onclick={() => switchTab('lifetime')}
-		class="px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors"
-		style="border-color: {activeTab === 'lifetime' ? 'var(--color-accent)' : 'transparent'}; color: {activeTab === 'lifetime' ? 'var(--color-text)' : 'var(--color-muted)'};"
-	>
-		Lifetime
-	</button>
-	<button
-		onclick={() => switchTab('resources')}
-		class="px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors"
-		style="border-color: {activeTab === 'resources' ? 'var(--color-accent)' : 'transparent'}; color: {activeTab === 'resources' ? 'var(--color-text)' : 'var(--color-muted)'};"
-	>
-		Resources
-	</button>
+<div class="flex items-center gap-1 mt-4 mb-5 p-1 rounded-xl border w-fit" style="background-color: var(--color-surface); border-color: var(--color-border);">
+	{#each TABS as t}
+		<button
+			onclick={() => switchTab(t.id)}
+			class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all"
+			style="{activeTab === t.id ? 'background-color: var(--color-accent-dim); color: var(--color-accent); border: 1px solid rgba(99,102,241,0.25);' : 'color: var(--color-muted); border: 1px solid transparent;'}"
+			onmouseenter={(e) => { if (activeTab !== t.id) (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--color-surface-raised)'; }}
+			onmouseleave={(e) => { if (activeTab !== t.id) (e.currentTarget as HTMLElement).style.backgroundColor = ''; }}
+		>
+			<svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d={t.icon}/></svg>
+			{t.label}{#if t.id === 'timeline' && importSource === 'file'}<span class="ml-0.5 w-1.5 h-1.5 rounded-full inline-block" style="background-color: var(--color-accent); vertical-align: middle;"></span>{/if}
+		</button>
+	{/each}
 </div>
 
 <!-- ── INSTANCES TAB ── -->
 {#if activeTab === 'instances'}
 	{#if error}
-		<div class="mb-4 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">
+		<div class="mb-4 rounded-xl border px-4 py-3 text-sm" style="background-color: var(--color-error-bg); border-color: var(--color-error-border); color: var(--color-error-text);">
 			<strong>AWS Error:</strong> {error}
 		</div>
 	{/if}
@@ -1516,15 +1521,15 @@
 				type="text"
 				placeholder="Search name or ID…"
 				bind:value={searchText}
-				class="w-full rounded pl-8 pr-3 py-1.5 text-sm border"
+				class="w-full rounded-lg pl-8 pr-3 py-1.5 text-sm border"
 				style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);"
 			/>
 		</div>
-		<select bind:value={filterType} class="rounded px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
+		<select bind:value={filterType} class="rounded-lg px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
 			<option value="">All types</option>
 			{#each distinctTypes as t}<option value={t}>{t}</option>{/each}
 		</select>
-		<select bind:value={filterAZ} class="rounded px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
+		<select bind:value={filterAZ} class="rounded-lg px-2 py-1.5 text-sm border" style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);">
 			<option value="">All AZs</option>
 			{#each distinctAZs as az}<option value={az}>{az}</option>{/each}
 		</select>
@@ -1532,7 +1537,7 @@
 			type="text"
 			placeholder="Required tags (Owner,Env…)"
 			bind:value={requiredTagsInput}
-			class="rounded px-2 py-1.5 text-sm border w-44"
+			class="rounded-lg px-2 py-1.5 text-sm border w-44"
 			style="background-color: var(--color-surface); border-color: var(--color-border); color: var(--color-text);"
 			title="Comma-separated tag keys that all instances should have. Enables compliance column and filter."
 		/>
@@ -1549,47 +1554,55 @@
 		{/if}
 	</div>
 
-	<!-- Stats strip -->
+	<!-- Stat cards -->
 	{#if !loading && instances.length > 0}
-		<div class="flex flex-wrap items-center gap-2 mb-3">
-			{#if stateCounts.running > 0}
-				<button onclick={() => toggleStateFilter('running')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: {filterStates.has('running') ? '#22c55e33' : 'var(--color-surface)'}; border: 1px solid {filterStates.has('running') ? '#22c55e' : 'var(--color-border)'}; color: {filterStates.has('running') ? '#22c55e' : 'var(--color-muted)'};">
-					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #22c55e;"></span>
-					{stateCounts.running} running
-				</button>
-			{/if}
-			{#if stateCounts.stopped > 0}
-				<button onclick={() => toggleStateFilter('stopped')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: {filterStates.has('stopped') ? '#eab30833' : 'var(--color-surface)'}; border: 1px solid {filterStates.has('stopped') ? '#eab308' : 'var(--color-border)'}; color: {filterStates.has('stopped') ? '#eab308' : 'var(--color-muted)'};">
-					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #eab308;"></span>
-					{stateCounts.stopped} stopped
-				</button>
-			{/if}
-			{#if stateCounts.terminated > 0}
-				<button onclick={() => toggleStateFilter('terminated')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: {filterStates.has('terminated') ? '#ef444433' : 'var(--color-surface)'}; border: 1px solid {filterStates.has('terminated') ? '#ef4444' : 'var(--color-border)'}; color: {filterStates.has('terminated') ? '#ef4444' : 'var(--color-muted)'};">
-					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #ef4444;"></span>
-					{stateCounts.terminated} terminated
-				</button>
-			{/if}
-			{#if stateCounts.other > 0}
-				<button onclick={() => toggleStateFilter('pending')} class="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors" style="background-color: var(--color-surface); border: 1px solid var(--color-border); color: var(--color-muted);">
-					<span class="w-1.5 h-1.5 rounded-full" style="background-color: #71717a;"></span>
-					{stateCounts.other} other
-				</button>
-			{/if}
-			<span class="text-xs ml-1" style="color: var(--color-muted);">{enrichedInstances.length} total</span>
+		<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+			{#each STAT_CARDS as card}
+				{@const count = stateCounts[card.state]}
+				{@const active = filterStates.has(card.state)}
+				{#if count > 0 || card.state === 'running'}
+					<button
+						onclick={() => toggleStateFilter(card.state)}
+						class="rounded-xl p-4 border text-left transition-all"
+						style="background-color: {active ? card.color + '18' : 'var(--color-surface)'}; border-color: {active ? card.color + '66' : 'var(--color-border)'};"
+						onmouseenter={(e) => { if (!active) (e.currentTarget as HTMLElement).style.borderColor = card.color + '55'; }}
+						onmouseleave={(e) => { if (!active) (e.currentTarget as HTMLElement).style.borderColor = active ? card.color + '66' : 'var(--color-border)'; }}
+					>
+						<div class="flex items-start justify-between mb-2">
+							<span class="text-xs font-semibold uppercase tracking-wide" style="color: {card.color};">{card.label}</span>
+							<svg class="w-4 h-4 shrink-0" style="color: {card.color}; opacity: 0.7;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d={card.icon}/></svg>
+						</div>
+						<p class="text-2xl font-bold tracking-tight">{count}</p>
+						{#if card.state === 'running' && runningEstimatedCost > 0}
+							<p class="text-xs mt-1" style="color: var(--color-muted);">~{fmtCost(runningEstimatedCost)}/mo</p>
+						{:else if card.state === 'stopped' && count > 0}
+							<p class="text-xs mt-1" style="color: var(--color-muted);">EBS costs</p>
+						{/if}
+					</button>
+				{/if}
+			{/each}
+			<!-- Total card -->
+			<div class="rounded-xl p-4 border" style="background-color: var(--color-surface); border-color: var(--color-border);">
+				<div class="flex items-start justify-between mb-2">
+					<span class="text-xs font-semibold uppercase tracking-wide" style="color: var(--color-accent);">Total</span>
+					<svg class="w-4 h-4 shrink-0" style="color: var(--color-accent); opacity: 0.7;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+				</div>
+				<p class="text-2xl font-bold tracking-tight">{enrichedInstances.length}</p>
+				<p class="text-xs mt-1 truncate" style="color: var(--color-muted);">{[region, ...extraRegions].join(', ')}</p>
+			</div>
 		</div>
 	{/if}
 
 	<!-- Cost / Waste panel -->
 	{#if !loading && instances.length > 0 && (wasteFlags.longRunning.length > 0 || wasteFlags.stoppedInstances.length > 0 || wasteFlags.neverTagged.length > 0 || volumesLoaded)}
-		<div class="rounded-lg border mb-3 p-3 text-xs" style="border-color: #f59e0b44; background-color: #f59e0b08;">
+		<div class="rounded-xl border mb-4 p-4 text-xs" style="border-color: var(--color-warn-border); background-color: var(--color-warn-bg);">
 			<div class="flex flex-wrap items-center gap-x-4 gap-y-1">
-				<span class="font-semibold" style="color: #f59e0b;">Cost &amp; Waste</span>
+				<span class="font-semibold uppercase tracking-wide" style="color: var(--color-warn-text);">Cost &amp; Waste</span>
 				{#if estimatedMonthlyCost > 0}
-					<span style="color: var(--color-text);">~{fmtCost(estimatedMonthlyCost)}/mo running</span>
+					<span style="color: var(--color-warn-text); font-weight: 600;">~{fmtCost(estimatedMonthlyCost)}/mo running</span>
 				{/if}
 				{#if wasteFlags.longRunning.length > 0}
-					<button onclick={() => { filterStates = new Set(['running']); }} class="flex items-center gap-1" style="color: #f59e0b;" title="Show these instances">
+					<button onclick={() => { filterStates = new Set(['running']); }} class="flex items-center gap-1 underline underline-offset-2" style="color: var(--color-warn-text);" title="Show these instances">
 						⚠ {wasteFlags.longRunning.length} running &gt;30 days
 					</button>
 				{/if}
@@ -1709,11 +1722,11 @@
 		</div>
 	{/if}
 
-	<div class="rounded-lg border overflow-hidden" style="border-color: var(--color-border);">
-		<div class="overflow-x-auto">
+	<div class="rounded-xl border overflow-hidden" style="border-color: var(--color-border);">
+		<div class="overflow-x-auto max-h-[calc(100vh-300px)] overflow-y-auto">
 			<table class="w-full text-sm">
-				<thead>
-					<tr style="background-color: var(--color-surface); border-bottom: 1px solid var(--color-border);">
+				<thead class="sticky top-0 z-10">
+					<tr style="background-color: var(--color-surface); border-bottom: 2px solid var(--color-border);">
 						<th class="px-2 py-3 w-8"></th>
 						{#each ALL_COLUMNS.filter(c => effectiveVisibleCols.has(c.key)) as col}
 							<th
@@ -1790,7 +1803,7 @@
 								{/if}
 								{#if effectiveVisibleCols.has('state')}
 								<td class="px-4 py-3">
-									<span class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium"
+									<span class="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium uppercase tracking-wide"
 										style="background-color: {stateColor(inst.state)}22; color: {stateColor(inst.state)};">
 										<span class="w-1.5 h-1.5 rounded-full" style="background-color: {stateColor(inst.state)};"></span>
 										{inst.state}
@@ -1871,7 +1884,7 @@
 										<!-- Network + instance metadata grid -->
 										<div class="grid grid-cols-2 gap-4 mb-4 text-xs">
 											<div>
-												<p class="font-semibold mb-2" style="color: var(--color-muted);">NETWORK</p>
+												<p class="text-xs font-semibold uppercase tracking-widest mb-2" style="color: var(--color-muted);">NETWORK</p>
 												<dl class="space-y-1">
 													{#each [['Private IP', inst.private_ip], ['Public IP', inst.public_ip], ['VPC', inst.vpc_id], ['Subnet', inst.subnet_id]] as [label, val]}
 														<div class="flex gap-2 group/copyfield">
@@ -1899,7 +1912,7 @@
 												</dl>
 											</div>
 											<div>
-												<p class="font-semibold mb-2" style="color: var(--color-muted);">INSTANCE</p>
+												<p class="text-xs font-semibold uppercase tracking-widest mb-2" style="color: var(--color-muted);">INSTANCE</p>
 												<dl class="space-y-1">
 													{#each [['AMI', inst.image_id], ['Key Pair', inst.key_name], ['Architecture', inst.architecture]] as [label, val]}
 														<div class="flex gap-2">
@@ -2072,13 +2085,13 @@
 <!-- ── TIMELINE TAB ── -->
 {:else if activeTab === 'timeline'}
 	{#if importError}
-		<div class="mb-4 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">
+		<div class="mb-4 rounded-xl border px-4 py-3 text-sm" style="background-color: var(--color-error-bg); border-color: var(--color-error-border); color: var(--color-error-text);">
 			<strong>Import error:</strong> {importError}
 		</div>
 	{/if}
 
 	{#if eventsError && importSource === 'api'}
-		<div class="mb-4 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">
+		<div class="mb-4 rounded-xl border px-4 py-3 text-sm" style="background-color: var(--color-error-bg); border-color: var(--color-error-border); color: var(--color-error-text);">
 			<strong>AWS Error:</strong> {eventsError}
 		</div>
 	{/if}
@@ -2193,7 +2206,7 @@
 								>
 									<td class="px-4 py-2.5 whitespace-nowrap text-xs" title={evt.event_time}>{fmtDate(evt.event_time)}</td>
 									<td class="px-4 py-2.5">
-										<span class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium"
+										<span class="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium uppercase tracking-wide"
 											style="background-color: {eventColor(evt.event_name)}22; color: {eventColor(evt.event_name)};">
 											<span class="w-1.5 h-1.5 rounded-full" style="background-color: {eventColor(evt.event_name)};"></span>
 											{EVENT_LABELS[evt.event_name] ?? evt.event_name}
@@ -2417,7 +2430,7 @@
 		</div>
 
 		{#if costResourcesError}
-			<div class="mb-3 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">{costResourcesError}</div>
+			<div class="mb-3 rounded border px-4 py-3 text-sm" style="background-color: var(--color-error-bg); border-color: var(--color-error-border); color: var(--color-error-text);">{costResourcesError}</div>
 		{/if}
 
 		{#if costResourcesLoaded && filteredCostResources.length > 0}
@@ -2542,7 +2555,7 @@
 		</div>
 
 		{#if tagError}
-			<div class="mb-3 rounded border px-4 py-3 text-sm" style="background-color: #1f0a0a; border-color: #7f1d1d; color: #fca5a5;">{tagError}</div>
+			<div class="mb-3 rounded border px-4 py-3 text-sm" style="background-color: var(--color-error-bg); border-color: var(--color-error-border); color: var(--color-error-text);">{tagError}</div>
 		{/if}
 
 		{#if tagSearched && !tagLoading}
@@ -2626,19 +2639,19 @@
 <div class="fixed bottom-0 left-0 right-0 z-50 flex flex-col" style="border-top: 1px solid var(--color-border);">
 	{#if logsOpen}
 		<div bind:this={logScrollEl} class="overflow-y-auto font-mono text-xs"
-			style="height: 200px; background-color: #0a0a0c;">
+			style="height: 200px; background-color: var(--color-bg); transition: height 0.2s ease;">
 			{#if logEntries.length === 0}
 				<p class="px-4 py-3" style="color: var(--color-muted);">No log entries yet.</p>
 			{:else}
 				{#each logEntries as entry (entry.id)}
 					<div class="flex gap-2 px-3 py-0.5 border-b items-baseline"
-						style="border-color: #1a1a1f; background-color: {entry.level === 'error' ? '#1f0a0a' : entry.level === 'warn' ? '#1a1500' : 'transparent'};">
-						<span class="shrink-0 tabular-nums" style="color: #4b5563;">{fmtTime(entry.time)}</span>
+						style="border-color: var(--color-border); background-color: {entry.level === 'error' ? 'var(--color-error-bg)' : entry.level === 'warn' ? 'var(--color-warn-bg)' : 'transparent'};">
+						<span class="shrink-0 tabular-nums" style="color: var(--color-muted);">{fmtTime(entry.time)}</span>
 						<span class="shrink-0 w-10 font-bold" style="color: {entry.level === 'error' ? '#f87171' : entry.level === 'warn' ? '#fbbf24' : '#6ee7b7'};">{entry.level.toUpperCase()}</span>
 						<span class="shrink-0 w-20" style="color: #6366f1;">[{entry.source}]</span>
-						<span class="flex-1 break-all" style="color: {entry.level === 'error' ? '#fca5a5' : entry.level === 'warn' ? '#fde68a' : 'var(--color-text)'};">{entry.message}</span>
+						<span class="flex-1 break-all" style="color: {entry.level === 'error' ? 'var(--color-error-text)' : entry.level === 'warn' ? 'var(--color-warn-text)' : 'var(--color-text)'};">{entry.message}</span>
 						{#if entry.duration !== undefined}
-							<span class="shrink-0 tabular-nums" style="color: #4b5563;">{fmtDuration(entry.duration)}</span>
+							<span class="shrink-0 tabular-nums" style="color: var(--color-muted);">{fmtDuration(entry.duration)}</span>
 						{/if}
 					</div>
 				{/each}
@@ -2652,7 +2665,7 @@
 		<svg class="w-3 h-3 transition-transform" style="color: var(--color-muted); transform: rotate({logsOpen ? '180deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
 		<span class="text-xs font-semibold" style="color: var(--color-muted);">LOGS</span>
 		{#if errorCount > 0}
-			<span class="rounded px-1.5 py-0.5 text-xs font-bold" style="background-color: #7f1d1d; color: #fca5a5;">{errorCount} error{errorCount !== 1 ? 's' : ''}</span>
+			<span class="rounded px-1.5 py-0.5 text-xs font-bold" style="background-color: var(--color-error-bg); border: 1px solid var(--color-error-border); color: var(--color-error-text);">{errorCount} error{errorCount !== 1 ? 's' : ''}</span>
 		{/if}
 		{#if !logsOpen && latestEntry}
 			<span class="font-mono text-xs truncate flex-1" style="color: {latestEntry.level === 'error' ? '#f87171' : latestEntry.level === 'warn' ? '#fbbf24' : '#4b5563'};">{fmtTime(latestEntry.time)} [{latestEntry.source}] {latestEntry.message}</span>

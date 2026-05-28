@@ -1,10 +1,70 @@
 @import 'tailwindcss';
 
+/* Design tokens — dark theme defaults */
 @theme {
-  --color-bg: #0f0f11;
-  --color-surface: #18181b;
+  --color-bg: #09090b;
+  --color-surface: #111113;
+  --color-surface-raised: #1c1c1f;
   --color-border: #27272a;
-  --color-text: #e4e4e7;
-  --color-muted: #71717a;
+  --color-border-subtle: #3f3f46;
+  --color-text: #f4f4f5;
+  --color-text-secondary: #a1a1aa;
+  --color-muted: #52525b;
   --color-accent: #6366f1;
+  --color-accent-hover: #4f46e5;
+  --color-accent-dim: rgba(99, 102, 241, 0.12);
+  --color-error-bg: #1c0808;
+  --color-error-border: #7f1d1d;
+  --color-error-text: #fca5a5;
+  --color-warn-bg: #1a1200;
+  --color-warn-border: #78350f;
+  --color-warn-text: #fcd34d;
 }
+
+/* Light theme overrides */
+[data-theme="light"] {
+  --color-bg: #f4f4f8;
+  --color-surface: #ffffff;
+  --color-surface-raised: #ebebf0;
+  --color-border: #e4e4e7;
+  --color-border-subtle: #d4d4d8;
+  --color-text: #09090b;
+  --color-text-secondary: #52525b;
+  --color-muted: #a1a1aa;
+  --color-accent: #4f46e5;
+  --color-accent-hover: #4338ca;
+  --color-accent-dim: rgba(79, 70, 229, 0.08);
+  --color-error-bg: #fef2f2;
+  --color-error-border: #fca5a5;
+  --color-error-text: #b91c1c;
+  --color-warn-bg: #fffbeb;
+  --color-warn-border: #fde68a;
+  --color-warn-text: #92400e;
+}
+
+/* Typography */
+:root {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+/* Smooth theme transitions */
+*, *::before, *::after {
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.1s ease, box-shadow 0.15s ease;
+}
+
+/* Thin custom scrollbars */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border-subtle); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-muted); }
+
+/* Focus rings */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Prevent focus rings on mouse interaction */
+:focus:not(:focus-visible) { outline: none; }
