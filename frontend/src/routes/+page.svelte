@@ -1052,7 +1052,7 @@
 				if (!inst) continue;
 				const start = new Date(inst.launch_time).getTime();
 				const st: GanttSegment['state'] = inst.state === 'running' ? 'running' : inst.state === 'terminated' ? 'terminated' : 'stopped';
-				const end = st === 'terminated' ? Math.min(start + 7200000, now) : now;
+				const end = st === 'terminated' ? start : now;
 				segs.push({ start, end, state: st, dashed: true });
 			} else {
 				let curState: GanttSegment['state'] | null = null;
@@ -1074,7 +1074,7 @@
 					} else if (evt.event_name === 'TerminateInstances') {
 						if (!curState) { curState = 'running'; curStart = t; dashed = true; }
 						close();
-						segs.push({ start: t, end: Math.min(t + 7200000, now), state: 'terminated', dashed: false });
+						segs.push({ start: t, end: t, state: 'terminated', dashed: false });
 						curState = null;
 					}
 				}
@@ -2300,13 +2300,14 @@
 							<!-- Segments -->
 							{#each row.segments as seg}
 								{@const x1 = Math.max(0, (seg.start - ganttViewRange.min) / range * ganttSvgWidth)}
-								{@const x2 = Math.min(ganttSvgWidth, (seg.end - ganttViewRange.min) / range * ganttSvgWidth)}
-								{#if x2 > x1 + 0.5}
+								{@const x2raw = Math.min(ganttSvgWidth, (seg.end - ganttViewRange.min) / range * ganttSvgWidth)}
+								{@const barW = seg.state === 'terminated' ? 8 : Math.max(x2raw - x1, 0)}
+								{#if barW > 0 && x1 <= ganttSvgWidth}
 									<rect
 										role="button"
 										tabindex="0"
 										x={x1} y={yBar}
-										width={x2 - x1} height={GANTT_BAR_H}
+										width={barW} height={GANTT_BAR_H}
 										rx="3" ry="3"
 										fill={stateColor(seg.state)}
 										opacity={seg.dashed ? 0.5 : 0.75}
@@ -2355,11 +2356,15 @@
 				<span class="w-2 h-2 rounded-full" style="background-color: {stateColor(ganttTooltip.seg.state)};"></span>
 				<span style="color: {stateColor(ganttTooltip.seg.state)};">{ganttTooltip.seg.state}</span>
 			</p>
-			<p style="color: var(--color-muted);">{fmtDate(new Date(ganttTooltip.seg.start).toISOString())}</p>
-			<p style="color: var(--color-muted);">→ {fmtDate(new Date(ganttTooltip.seg.end).toISOString())}</p>
-			<p class="mt-1 font-medium">{fmtDuration2(ganttTooltip.seg.end - ganttTooltip.seg.start)}</p>
-			{#if ganttTooltip.seg.dashed}
-				<p class="mt-1 italic" style="color: var(--color-muted); font-size: 9px;">Origin pre-dates event data</p>
+			{#if ganttTooltip.seg.state === 'terminated'}
+				<p style="color: var(--color-muted);">{fmtDate(new Date(ganttTooltip.seg.start).toISOString())}</p>
+			{:else}
+				<p style="color: var(--color-muted);">{fmtDate(new Date(ganttTooltip.seg.start).toISOString())}</p>
+				<p style="color: var(--color-muted);">→ {fmtDate(new Date(ganttTooltip.seg.end).toISOString())}</p>
+				<p class="mt-1 font-medium">{fmtDuration2(ganttTooltip.seg.end - ganttTooltip.seg.start)}</p>
+				{#if ganttTooltip.seg.dashed}
+					<p class="mt-1 italic" style="color: var(--color-muted); font-size: 9px;">Origin pre-dates event data</p>
+				{/if}
 			{/if}
 		</div>
 	{/if}
