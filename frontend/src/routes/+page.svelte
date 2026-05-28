@@ -206,6 +206,23 @@
 	function stateColor(s: string): string { return STATE_COLORS[s] ?? '#71717a'; }
 	function eventColor(n: string): string { return EVENT_COLORS[n] ?? '#71717a'; }
 
+	function instanceLifetimeCost(inst: { instance_type: string; state: string; launch_time: string; last_stopped?: string | null; last_terminated?: string | null }): number | null {
+		const monthly = estimateInstanceCostPerMonth(inst.instance_type);
+		if (monthly == null) return null;
+		const hourlyRate = monthly / 730;
+		const startMs = new Date(inst.launch_time).getTime();
+		let endMs: number;
+		if (inst.state === 'terminated') {
+			endMs = inst.last_terminated ? new Date(inst.last_terminated).getTime() : Date.now();
+		} else if (inst.state === 'stopped') {
+			endMs = inst.last_stopped ? new Date(inst.last_stopped).getTime() : Date.now();
+		} else {
+			endMs = Date.now();
+		}
+		const hours = Math.max(0, (endMs - startMs) / 3_600_000);
+		return hourlyRate * hours;
+	}
+
 	function fmtDate(iso: string | null): string {
 		if (!iso) return '';
 		return new Date(iso).toLocaleString();
@@ -1884,6 +1901,7 @@
 								{#if effectiveVisibleCols.has('vpc')}<td class="px-4 py-3 font-mono text-xs" style="color: var(--color-muted);">{inst.vpc_id ?? '—'}</td>{/if}
 								{#if effectiveVisibleCols.has('iam')}<td class="px-4 py-3 font-mono text-xs truncate max-w-xs" style="color: var(--color-muted);" title={inst.iam_profile ?? ''}>{inst.iam_profile ? shortUsername(inst.iam_profile) : '—'}</td>{/if}
 							{#if effectiveVisibleCols.has('cost')}
+							{@const ltCost = instanceLifetimeCost(inst)}
 							<td class="px-4 py-3 text-xs whitespace-nowrap" style="color: var(--color-muted);">
 								{#if inst.state === 'running'}
 									<span title="Approximate on-demand Linux price, us-east-1">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type) ?? 0)}/mo</span>
@@ -1891,6 +1909,9 @@
 									<span style="color: #eab308;" title="Stopped: no compute cost but EBS storage still billed">EBS only</span>
 								{:else}
 									<span>—</span>
+								{/if}
+								{#if ltCost != null && ltCost > 0}
+									<div class="mt-0.5 text-xs" style="color: var(--color-muted);" title="Estimated total compute cost since launch">~{fmtCost(ltCost)} total</div>
 								{/if}
 							</td>
 							{/if}
@@ -1962,6 +1983,38 @@
 												</dl>
 											</div>
 										</div>
+
+										<!-- Lifetime Cost -->
+										{#if instanceLifetimeCost(inst) != null}
+										<div class="border-t pt-3 mb-4" style="border-color: var(--color-border);">
+											<p class="text-xs font-semibold uppercase tracking-widest mb-2" style="color: var(--color-muted);">COST</p>
+											<div class="flex items-end gap-6 text-xs">
+												<div>
+													<p class="text-xl font-bold tracking-tight">~{fmtCost(instanceLifetimeCost(inst)!)}</p>
+													<p class="mt-0.5" style="color: var(--color-muted);">estimated lifetime total</p>
+												</div>
+												{#if estimateInstanceCostPerMonth(inst.instance_type) != null}
+												<div style="color: var(--color-muted);">
+													<p class="font-medium" style="color: var(--color-text-secondary);">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type)!)}/mo</p>
+													<p class="mt-0.5">on-demand rate</p>
+												</div>
+												{/if}
+												<div style="color: var(--color-muted);">
+													{#if (Date.now() - new Date(inst.launch_time).getTime()) / 3_600_000 < 24}
+														<p class="font-medium" style="color: var(--color-text-secondary);">{Math.round((Date.now() - new Date(inst.launch_time).getTime()) / 3_600_000)}h</p>
+													{:else if (Date.now() - new Date(inst.launch_time).getTime()) / 3_600_000 < 24 * 30}
+														<p class="font-medium" style="color: var(--color-text-secondary);">{Math.round((Date.now() - new Date(inst.launch_time).getTime()) / 86_400_000)}d</p>
+													{:else}
+														<p class="font-medium" style="color: var(--color-text-secondary);">{Math.round((Date.now() - new Date(inst.launch_time).getTime()) / (86_400_000 * 30))}mo</p>
+													{/if}
+													<p class="mt-0.5">since launch</p>
+												</div>
+											</div>
+											<p class="mt-2 text-xs" style="color: var(--color-muted);" title="Assumes continuous running at on-demand Linux us-east-1 price">
+												Assumes continuous running · on-demand Linux us-east-1
+											</p>
+										</div>
+										{/if}
 
 										<!-- Event History -->
 										<div class="border-t pt-3 mb-4" style="border-color: var(--color-border);">
