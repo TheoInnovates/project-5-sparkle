@@ -73,6 +73,7 @@
 
 	// ── Instance management ───────────────────────────────────────────────────
 	let expandedId = $state<string | null>(null);
+	let expandedVolumeId = $state<string | null>(null);
 	let actionLoading = $state<string | null>(null);
 	let actionError = $state<Record<string, string>>({});
 	let confirmTerminateId = $state<string | null>(null);
@@ -460,6 +461,11 @@
 	function jumpToTimeline(instanceId: string) {
 		tlFilterInstanceId = instanceId;
 		activeTab = 'timeline';
+	}
+
+	function jumpToInstance(instanceId: string) {
+		activeTab = 'instances';
+		expandedId = instanceId;
 	}
 
 	const filteredActiveEvents = $derived(
@@ -1612,6 +1618,7 @@
 					<table class="w-full text-xs">
 						<thead>
 							<tr style="border-bottom: 1px solid var(--color-border);">
+								<th class="px-2 py-1.5 w-6"></th>
 								{#each ['Volume ID','Name','State','Size','Type','Attached To','Age','Est. Cost/mo'] as h}
 									<th class="text-left px-2 py-1.5 font-semibold" style="color: var(--color-muted);">{h}</th>
 								{/each}
@@ -1622,7 +1629,17 @@
 								{@const isWaste = v.state === 'available'}
 								{@const ageDays = Math.floor((Date.now() - new Date(v.create_time).getTime()) / 86400000)}
 								{@const cost = estimateEBSCostPerMonth(v.volume_type, v.size_gb)}
-								<tr style="border-bottom: 1px solid var(--color-border); {isWaste ? 'background-color: #f59e0b08;' : ''}">
+								{@const isVolExpanded = expandedVolumeId === v.volume_id}
+								<tr
+									class="cursor-pointer transition-colors"
+									style="border-bottom: {isVolExpanded ? 'none' : '1px solid var(--color-border)'}; {isWaste ? 'background-color: #f59e0b08;' : ''}"
+									onclick={() => expandedVolumeId = isVolExpanded ? null : v.volume_id}
+									onmouseenter={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--color-surface)'}
+									onmouseleave={(e) => (e.currentTarget as HTMLElement).style.backgroundColor = isWaste ? '#f59e0b08' : (isVolExpanded ? 'var(--color-surface)' : '')}
+								>
+									<td class="px-2 py-1.5 w-6 text-center">
+										<svg class="w-3 h-3 inline transition-transform" style="color: var(--color-muted); transform: rotate({isVolExpanded ? '90deg' : '0deg'});" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+									</td>
 									<td class="px-2 py-1.5 font-mono">{v.volume_id}</td>
 									<td class="px-2 py-1.5" style="color: var(--color-muted);">{v.name ?? '—'}</td>
 									<td class="px-2 py-1.5">
@@ -1634,10 +1651,56 @@
 									</td>
 									<td class="px-2 py-1.5">{v.size_gb} GB</td>
 									<td class="px-2 py-1.5 font-mono" style="color: var(--color-muted);">{v.volume_type}</td>
-									<td class="px-2 py-1.5 font-mono text-xs" style="color: var(--color-muted);">{v.attachments.map(a => a.instance_id).join(', ') || '—'}</td>
+									<td class="px-2 py-1.5 font-mono" style="color: var(--color-muted);">{v.attachments.map(a => a.instance_id).join(', ') || '—'}</td>
 									<td class="px-2 py-1.5" style="color: var(--color-muted);">{ageDays}d</td>
 									<td class="px-2 py-1.5 font-medium" style="color: {isWaste ? '#f59e0b' : 'var(--color-muted)'};">~{fmtCost(cost)}</td>
 								</tr>
+								{#if isVolExpanded}
+									<tr style="border-bottom: 1px solid var(--color-border); background-color: var(--color-surface);">
+										<td colspan={9} class="px-4 pb-3 pt-2">
+											<div class="grid grid-cols-2 gap-4 text-xs">
+												<div>
+													<p class="font-semibold mb-1.5" style="color: var(--color-muted);">STORAGE</p>
+													<dl class="space-y-1">
+														{#each [['Created', fmtDate(v.create_time)], ['Volume Type', v.volume_type], ['IOPS', v.iops != null ? String(v.iops) : '—'], ['Throughput', v.throughput != null ? v.throughput + ' MB/s' : '—']] as [label, val]}
+															<div class="flex gap-2">
+																<dt class="w-24 shrink-0" style="color: var(--color-muted);">{label}</dt>
+																<dd class="font-mono">{val}</dd>
+															</div>
+														{/each}
+													</dl>
+												</div>
+												<div>
+													{#if v.attachments.length > 0}
+														<p class="font-semibold mb-1.5" style="color: var(--color-muted);">ATTACHED TO</p>
+														{#each v.attachments as a}
+															<div class="flex items-center gap-2 mb-1.5 flex-wrap">
+																<span class="font-mono">{a.instance_id}</span>
+																<span style="color: var(--color-muted);">on {a.device}</span>
+																<button
+																	onclick={(e) => { e.stopPropagation(); jumpToInstance(a.instance_id); }}
+																	class="text-xs rounded px-2 py-0.5 border transition-colors"
+																	style="border-color: var(--color-accent); color: var(--color-accent);"
+																>Jump to instance →</button>
+															</div>
+														{/each}
+													{:else}
+														<p class="font-semibold mb-1.5" style="color: var(--color-muted);">ATTACHED TO</p>
+														<p style="color: var(--color-muted);">Not attached</p>
+													{/if}
+													{#if v.tags?.length}
+														<p class="font-semibold mb-1.5 mt-2" style="color: var(--color-muted);">TAGS</p>
+														<div class="flex flex-wrap gap-1">
+															{#each v.tags as tag}
+																<span class="rounded px-1.5 py-0.5 font-mono" style="background-color: var(--color-border);">{tag.Key}: <span style="color: var(--color-muted);">{tag.Value}</span></span>
+															{/each}
+														</div>
+													{/if}
+												</div>
+											</div>
+										</td>
+									</tr>
+								{/if}
 							{/each}
 						</tbody>
 					</table>
