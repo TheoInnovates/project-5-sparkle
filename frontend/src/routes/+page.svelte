@@ -414,6 +414,11 @@
 	const sortedInstances = $derived(
 		[...filteredInstances].sort((a, b) => {
 			const dir = sortDir === 'asc' ? 1 : -1;
+			if (sortCol === 'cost') {
+				const ac = monthlyRate(a.instance_type, a.region ?? region) ?? -1;
+				const bc = monthlyRate(b.instance_type, b.region ?? region) ?? -1;
+				return (ac - bc) * dir;
+			}
 			let av = '', bv = '';
 			if (sortCol === 'name') { av = a.name; bv = b.name; }
 			else if (sortCol === 'id') { av = a.instance_id; bv = b.instance_id; }
@@ -441,7 +446,7 @@
 		{ key: 'started',    label: 'First Started',sort: 'started',  evt: true  },
 		{ key: 'username',   label: 'Username',     sort: 'username', evt: true  },
 		{ key: 'stopped',    label: 'Last Stopped', sort: 'stopped',  evt: true  },
-		{ key: 'cost',       label: 'Est. Cost/mo', sort: null,       evt: false },
+		{ key: 'cost',       label: 'Est. Cost/mo', sort: 'cost',     evt: false },
 		{ key: 'compliance', label: 'Tag Compliance',sort: null,      evt: false },
 		{ key: 'private_ip', label: 'Private IP',   sort: null,       evt: false },
 		{ key: 'public_ip',  label: 'Public IP',    sort: null,       evt: false },
@@ -1826,20 +1831,27 @@
 					<tr style="background-color: var(--color-surface); border-bottom: 2px solid var(--color-border);">
 						<th class="px-2 py-3 w-8"></th>
 						{#each ALL_COLUMNS.filter(c => effectiveVisibleCols.has(c.key)) as col}
+							{@const isActive = col.sort && sortCol === col.sort}
 							<th
-								class="text-left px-4 py-3 font-semibold whitespace-nowrap {col.sort ? 'cursor-pointer select-none' : ''}"
-								style="color: var(--color-muted);"
+								class="text-left px-4 py-3 font-semibold whitespace-nowrap {col.sort ? 'cursor-pointer select-none hover:opacity-100' : ''}"
+								style="color: {isActive ? 'var(--color-accent)' : 'var(--color-muted)'};"
 								onclick={() => col.sort && toggleSort(col.sort)}
 							>
-								{col.label}
-								{#if col.evt}
-									{#if eventsLoading}<svg class="inline w-3 h-3 animate-spin ml-1" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>{/if}
-								{/if}
-								{#if col.sort && sortCol === col.sort}
-									<svg class="inline w-3 h-3 ml-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-										{#if sortDir === 'asc'}<polyline points="18 15 12 9 6 15"/>{:else}<polyline points="6 9 12 15 18 9"/>{/if}
-									</svg>
-								{/if}
+								<span class="inline-flex items-center gap-1">
+									{col.label}
+									{#if col.evt && eventsLoading}
+										<svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+									{:else if col.sort && isActive}
+										<svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+											{#if sortDir === 'asc'}<polyline points="18 15 12 9 6 15"/>{:else}<polyline points="6 9 12 15 18 9"/>{/if}
+										</svg>
+									{:else if col.sort}
+										<svg class="w-3 h-3 shrink-0 opacity-30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+											<polyline points="18 9 12 3 6 9"/>
+											<polyline points="6 15 12 21 18 15"/>
+										</svg>
+									{/if}
+								</span>
 							</th>
 						{/each}
 					</tr>
