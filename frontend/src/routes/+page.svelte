@@ -493,6 +493,18 @@
 		unattachedVolumes.reduce((sum, v) => sum + estimateEBSCostPerMonth(v.volume_type, v.size_gb, region), 0)
 	);
 
+	const stoppedInstanceIds = $derived(
+		new Set(enrichedInstances.filter(i => i.state === 'stopped').map(i => i.instance_id))
+	);
+
+	const stoppedEBSCost = $derived(
+		volumesLoaded
+			? volumes
+				.filter(v => v.attachments.some(a => stoppedInstanceIds.has(a.instance_id)))
+				.reduce((sum, v) => sum + estimateEBSCostPerMonth(v.volume_type, v.size_gb, region), 0)
+			: null
+	);
+
 	// ── Tag compliance per instance ───────────────────────────────────────────
 	function missingTags(inst: typeof enrichedInstances[0]): string[] {
 		if (!requiredTags.length) return [];
@@ -1638,7 +1650,11 @@
 						{#if card.state === 'running' && runningEstimatedCost > 0}
 							<p class="text-xs mt-1" style="color: var(--color-muted);">~{fmtCost(runningEstimatedCost)}/mo</p>
 						{:else if card.state === 'stopped' && count > 0}
-							<p class="text-xs mt-1" style="color: var(--color-muted);">EBS costs</p>
+							{#if stoppedEBSCost != null && stoppedEBSCost > 0}
+								<p class="text-xs mt-1" style="color: var(--color-muted);">~{fmtCost(stoppedEBSCost)}/mo EBS</p>
+							{:else if stoppedEBSCost === null}
+								<p class="text-xs mt-1" style="color: var(--color-muted); opacity: 0.6;">EBS costs apply</p>
+							{/if}
 						{/if}
 					</button>
 				{/if}
