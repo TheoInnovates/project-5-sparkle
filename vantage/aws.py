@@ -932,3 +932,128 @@ class CredentialsError(Exception):
 
 class AWSError(Exception):
     pass
+
+
+# ── EC2 Pricing ───────────────────────────────────────────────────────────────
+
+_pricing_cache: dict[str, tuple[float, dict[str, float]]] = {}
+_PRICING_TTL = 24 * 3600  # 24 hours — prices rarely change
+
+
+def _pricing_region_endpoint(region: str) -> str:
+    """Return the correct pricing API region for a given AWS region."""
+    if region.startswith("us-gov"):
+        return "us-gov-west-1"
+    return "us-east-1"
+
+
+def _fetch_pricing_via_api(region: str, creds: Credentials | None) -> dict[str, float]:
+    """
+    Query the AWS Pricing API (requires pricing:GetProducts).
+    Works for commercial and GovCloud regions.
+    Returns {} if the call fails (no permission, network error, etc.).
+    """
+    try:
+        endpoint_region = _pricing_region_endpoint(region)
+        session = _make_session(creds)
+        client = session.client(
+            "pricing",
+            region_name=endpoint_region,
+            config=botocore.config.Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 2}),
+        )
+        paginator = client.get_paginator("get_products")
+        prices: dict[str, float] = {}
+        for page in paginator.paginate(
+            ServiceCode="AmazonEC2",
+            Filters=[
+                {"Type": "TERM_MATCH", "Field": "regionCode",      "Value": region},
+                {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux"},
+                {"Type": "TERM_MATCH", "Field": "tenancy",         "Value": "Shared"},
+                {"Type": "TERM_MATCH", "Field": "preInstalledSw",  "Value": "NA"},
+                {"Type": "TERM_MATCH", "Field": "licenseModel",    "Value": "No License required"},
+                {"Type": "TERM_MATCH", "Field": "capacitystatus",  "Value": "Used"},
+            ],
+            FormatVersion="aws_v1",
+        ):
+            for item_str in page["PriceList"]:
+                item = json.loads(item_str)
+                inst_type = item["product"]["attributes"].get("instanceType", "")
+                if not inst_type or "." not in inst_type:
+                    continue
+                for term in item.get("terms", {}).get("OnDemand", {}).values():
+                    for dim in term.get("priceDimensions", {}).values():
+                        usd = float(dim.get("pricePerUnit", {}).get("USD") or 0)
+                        if usd > 0:
+                            prices[inst_type] = usd
+        return prices
+    except Exception:
+        return {}
+
+
+def _fetch_pricing_via_public_url(region: str) -> dict[str, float]:
+    """
+    Fetch pricing from AWS's public (unauthenticated) JSON endpoint.
+    Works for all regions including GovCloud. File is large (~50-150 MB)
+    but is only downloaded once per process lifetime.
+    """
+    import urllib.request
+    url = (
+        f"https://pricing.us-east-1.amazonaws.com"
+        f"/offers/v1.0/aws/AmazonEC2/current/{region}/index.json"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+        data = json.loads(raw)
+
+        # Collect SKUs for on-demand Linux shared instances
+        wanted_skus: set[str] = set()
+        for sku, prod in data.get("products", {}).items():
+            if prod.get("productFamily") != "Compute Instance":
+                continue
+            attrs = prod.get("attributes", {})
+            if (attrs.get("operatingSystem") == "Linux"
+                    and attrs.get("tenancy") == "Shared"
+                    and attrs.get("preInstalledSw") == "NA"
+                    and attrs.get("licenseModel") == "No License required"
+                    and attrs.get("capacitystatus") == "Used"):
+                wanted_skus.add(sku)
+
+        prices: dict[str, float] = {}
+        for sku, terms in data.get("terms", {}).get("OnDemand", {}).items():
+            if sku not in wanted_skus:
+                continue
+            inst_type = data["products"][sku]["attributes"].get("instanceType", "")
+            if not inst_type or "." not in inst_type or inst_type in prices:
+                continue
+            for term in terms.values():
+                for dim in term.get("priceDimensions", {}).values():
+                    usd = float(dim.get("pricePerUnit", {}).get("USD") or 0)
+                    if usd > 0:
+                        prices[inst_type] = usd
+        return prices
+    except Exception:
+        return {}
+
+
+def fetch_ec2_pricing_sync(region: str, creds: Credentials | None) -> dict[str, float]:
+    """Return on-demand Linux hourly $/hr for all instance types in region. Cached 24h."""
+    cached = _pricing_cache.get(region)
+    if cached and (time.time() - cached[0]) < _PRICING_TTL:
+        return cached[1]
+
+    prices = _fetch_pricing_via_api(region, creds)
+    if not prices:
+        prices = _fetch_pricing_via_public_url(region)
+
+    _pricing_cache[region] = (time.time(), prices)
+    return prices
+
+
+async def fetch_ec2_pricing(region: str, creds: Credentials | None) -> dict[str, float]:
+    """Async wrapper — runs the blocking fetch in the thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, fetch_ec2_pricing_sync, region, creds)

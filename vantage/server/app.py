@@ -15,8 +15,8 @@ from pydantic import BaseModel
 from vantage.aws import (
     AWSError, Credentials, CredentialsError,
     InstanceEvent, InstanceRecord,
-    fetch_s3_events, list_cost_resources, list_events, list_instances, list_regions,
-    list_volumes, search_resources_by_tag,
+    fetch_ec2_pricing, fetch_s3_events, list_cost_resources, list_events, list_instances,
+    list_regions, list_volumes, search_resources_by_tag,
     reboot_instance, set_instance_tags, start_instance, stop_instance, terminate_instance,
 )
 
@@ -370,6 +370,19 @@ async def get_cost_resources(
         raise HTTPException(status_code=503, detail=str(e))
     except AWSError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/pricing")
+async def get_pricing(
+    region: str = Query(..., description="AWS region"),
+    x_aws_cred_source: str | None = Header(default=None),
+    x_aws_access_key_id: str | None = Header(default=None),
+    x_aws_secret_access_key: str | None = Header(default=None),
+    x_aws_session_token: str | None = Header(default=None),
+):
+    creds = _resolve_creds(x_aws_cred_source, x_aws_access_key_id, x_aws_secret_access_key, x_aws_session_token)
+    prices = await fetch_ec2_pricing(region, creds)
+    return {"region": region, "prices": prices, "count": len(prices)}
 
 
 @app.get("/api/config")

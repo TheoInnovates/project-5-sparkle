@@ -120,3 +120,12 @@ export const fetchS3Events = (region: string, params: S3QueryParams): Promise<In
 	if (params.endDate) qs.set('end_date', params.endDate);
 	return apiFetch<InstanceEvent[]>(`/api/s3-events?${qs}`, loadCredConfig(), 300000); // 5 min timeout
 };
+
+export interface PricingResult {
+	region: string;
+	prices: Record<string, number>;  // instance_type → on-demand hourly $/hr
+	count: number;
+}
+
+export const getPricing = (region: string): Promise<PricingResult> =>
+	apiFetch<PricingResult>(`/api/pricing?region=${encodeURIComponent(region)}`, loadCredConfig(), 120000);

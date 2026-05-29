@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { fetchS3Events, getConfig, listCostResources, listEvents, listInstances, listRegions, listVolumes, loadCredConfig, rebootInstance, searchByTag, startInstance, stopInstance, terminateInstance, updateTags } from '$lib/api';
+	import { fetchS3Events, getConfig, getPricing, listCostResources, listEvents, listInstances, listRegions, listVolumes, loadCredConfig, rebootInstance, searchByTag, startInstance, stopInstance, terminateInstance, updateTags } from '$lib/api';
 	import type { CostResource, EBSVolume, InstanceEvent, InstanceRecord, TagResource } from '$lib/types';
-	import { estimateInstanceCostPerMonth, estimateEBSCostPerMonth, fmtCost, resourceTypeMeta } from '$lib/prices';
+	import { estimateInstanceCostPerHour, estimateInstanceCostPerMonth, estimateEBSCostPerMonth, fmtCost, resourceTypeMeta } from '$lib/prices';
 
 	let region = $state('us-east-1');
 	let regions = $state<string[]>([]);
@@ -18,6 +18,35 @@
 	let extraRegions = $state<string[]>([]);
 	let addRegionOpen = $state(false);
 	let scanAllLoading = $state(false);
+
+	// ── Live pricing (fetched from backend, keyed by region) ─────────────────
+	let fetchedPrices = $state<Record<string, Record<string, number>>>({});
+
+	async function loadPricing(r: string) {
+		if (fetchedPrices[r]) return; // already loaded
+		try {
+			const result = await getPricing(r);
+			if (result.count > 0) {
+				fetchedPrices = { ...fetchedPrices, [r]: result.prices };
+			}
+		} catch { /* fall back to hardcoded estimates */ }
+	}
+
+	// Returns on-demand hourly rate: live price if available, otherwise hardcoded estimate.
+	function hourlyRate(instanceType: string, instRegion: string): number | null {
+		const live = fetchedPrices[instRegion]?.[instanceType];
+		if (live != null) return live;
+		return estimateInstanceCostPerHour(instanceType, instRegion);
+	}
+
+	function monthlyRate(instanceType: string, instRegion: string): number | null {
+		const hr = hourlyRate(instanceType, instRegion);
+		return hr != null ? hr * 730 : null;
+	}
+
+	function pricingSource(instRegion: string): 'live' | 'estimate' {
+		return fetchedPrices[instRegion] ? 'live' : 'estimate';
+	}
 
 	// ── Tag / Resource search ─────────────────────────────────────────────────
 	let tagKey = $state('');
@@ -208,7 +237,7 @@
 
 	function instanceLifetimeCost(inst: { instance_type: string; state: string; launch_time: string; last_stopped?: string | null; last_terminated?: string | null; region?: string }): number | null {
 		const instRegion = inst.region ?? region;
-		const monthly = estimateInstanceCostPerMonth(inst.instance_type, instRegion);
+		const monthly = monthlyRate(inst.instance_type, instRegion);
 		if (monthly == null) return null;
 		const hourlyRate = monthly / 730;
 		const startMs = new Date(inst.launch_time).getTime();
@@ -352,7 +381,7 @@
 	const runningEstimatedCost = $derived(
 		enrichedInstances
 			.filter(i => i.state === 'running')
-			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type, i.region ?? region) ?? 0), 0)
+			.reduce((sum, i) => sum + (monthlyRate(i.instance_type, i.region ?? region) ?? 0), 0)
 	);
 
 	function toggleStateFilter(s: string) {
@@ -457,7 +486,7 @@
 	const estimatedMonthlyCost = $derived(
 		sortedInstances
 			.filter(i => i.state === 'running')
-			.reduce((sum, i) => sum + (estimateInstanceCostPerMonth(i.instance_type, i.region ?? region) ?? 0), 0)
+			.reduce((sum, i) => sum + (monthlyRate(i.instance_type, i.region ?? region) ?? 0), 0)
 	);
 
 	const unattachedEBSWaste = $derived(
@@ -713,6 +742,7 @@
 			instances = merged;
 			lastRefreshed = new Date();
 			addLog('info', 'instances', `Loaded ${instances.length} instance${instances.length !== 1 ? 's' : ''} from ${allRegions.length} region${allRegions.length !== 1 ? 's' : ''}`, Date.now() - t0);
+			allRegions.forEach(r => loadPricing(r));
 			if (!eventsLoaded && !eventsLoading && importSource === 'api') loadEventsData();
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
@@ -1904,9 +1934,10 @@
 							{#if effectiveVisibleCols.has('cost')}
 							{@const instRegion = inst.region ?? region}
 							{@const ltCost = instanceLifetimeCost(inst)}
+							{@const mr = monthlyRate(inst.instance_type, instRegion)}
 							<td class="px-4 py-3 text-xs whitespace-nowrap" style="color: var(--color-muted);">
 								{#if inst.state === 'running'}
-									<span title="Approximate on-demand Linux price, {instRegion}">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type, instRegion) ?? 0)}/mo</span>
+									<span title="{pricingSource(instRegion) === 'live' ? 'Live on-demand Linux price' : 'Estimated on-demand Linux price'}, {instRegion}">{pricingSource(instRegion) === 'estimate' ? '~' : ''}{fmtCost(mr ?? 0)}/mo</span>
 								{:else if inst.state === 'stopped'}
 									<span style="color: #eab308;" title="Stopped: no compute cost but EBS storage still billed">EBS only</span>
 								{:else}
@@ -1993,12 +2024,12 @@
 											<p class="text-xs font-semibold uppercase tracking-widest mb-2" style="color: var(--color-muted);">COST</p>
 											<div class="flex items-end gap-6 text-xs">
 												<div>
-													<p class="text-xl font-bold tracking-tight">~{fmtCost(instanceLifetimeCost(inst)!)}</p>
-													<p class="mt-0.5" style="color: var(--color-muted);">estimated lifetime total</p>
+													<p class="text-xl font-bold tracking-tight">{pricingSource(inst.region ?? region) === 'estimate' ? '~' : ''}{fmtCost(instanceLifetimeCost(inst)!)}</p>
+													<p class="mt-0.5" style="color: var(--color-muted);">{pricingSource(inst.region ?? region) === 'live' ? '' : 'estimated '}lifetime total</p>
 												</div>
-												{#if estimateInstanceCostPerMonth(inst.instance_type, instRegion) != null}
+												{#if monthlyRate(inst.instance_type, instRegion) != null}
 												<div style="color: var(--color-muted);">
-													<p class="font-medium" style="color: var(--color-text-secondary);">~{fmtCost(estimateInstanceCostPerMonth(inst.instance_type, instRegion)!)}/mo</p>
+													<p class="font-medium" style="color: var(--color-text-secondary);">{pricingSource(instRegion) === 'estimate' ? '~' : ''}{fmtCost(monthlyRate(inst.instance_type, instRegion)!)}/mo</p>
 													<p class="mt-0.5">on-demand rate</p>
 												</div>
 												{/if}
@@ -2013,8 +2044,8 @@
 													<p class="mt-0.5">since launch</p>
 												</div>
 											</div>
-											<p class="mt-2 text-xs" style="color: var(--color-muted);" title="Approximate on-demand Linux price for {instRegion}">
-												Approximate on-demand Linux · {instRegion}
+											<p class="mt-2 text-xs" style="color: var(--color-muted);">
+												{pricingSource(instRegion) === 'live' ? 'Live' : 'Estimated'} on-demand Linux · {instRegion}
 											</p>
 										</div>
 										{/if}
