@@ -45,7 +45,7 @@ export interface EBSVolume {
 	throughput: number | null;
 	create_time: string;
 	name: string | null;
-	attachments: { instance_id: string; device: string }[];
+	attachments: { instance_id: string; device: string; state?: string }[];
 	tags: { Key: string; Value: string }[];
 }
 

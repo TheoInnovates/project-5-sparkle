@@ -545,7 +545,11 @@ def list_volumes(region: str, creds: Credentials | None) -> list[dict]:
                     "create_time": v["CreateTime"].isoformat(),
                     "name": name_tag,
                     "attachments": [
-                        {"instance_id": a["InstanceId"], "device": a["Device"]}
+                        {
+                            "instance_id": a["InstanceId"],
+                            "device": a["Device"],
+                            "state": a.get("State", "attached"),
+                        }
                         for a in v.get("Attachments", [])
                     ],
                     "tags": v.get("Tags", []),

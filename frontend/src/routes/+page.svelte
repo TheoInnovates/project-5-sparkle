@@ -1766,7 +1766,19 @@
 									</td>
 									<td class="px-2 py-1.5">{v.size_gb} GB</td>
 									<td class="px-2 py-1.5 font-mono" style="color: var(--color-muted);">{v.volume_type}</td>
-									<td class="px-2 py-1.5 font-mono" style="color: var(--color-muted);">{v.attachments.map(a => a.instance_id).join(', ') || '—'}</td>
+									<td class="px-2 py-1.5 font-mono text-xs" style="color: var(--color-muted);">
+										{#if v.attachments.length > 0}
+											{#each v.attachments as a}
+												{@const name = instanceNameMap[a.instance_id]}
+												<span title="{a.instance_id}{a.state === 'detached' ? ' (was attached)' : ''}" style="color: {a.state === 'detached' ? 'var(--color-muted)' : 'var(--color-text)'};">
+													{name ?? a.instance_id}
+													{#if a.state === 'detached'}<span style="opacity:0.6;"> (detached)</span>{/if}
+												</span>
+											{/each}
+										{:else}
+											—
+										{/if}
+									</td>
 									<td class="px-2 py-1.5" style="color: var(--color-muted);">{ageDays}d</td>
 									<td class="px-2 py-1.5 font-medium" style="color: {isWaste ? '#f59e0b' : 'var(--color-muted)'};">~{fmtCost(cost)}</td>
 								</tr>
@@ -1787,21 +1799,33 @@
 												</div>
 												<div>
 													{#if v.attachments.length > 0}
-														<p class="font-semibold mb-1.5" style="color: var(--color-muted);">ATTACHED TO</p>
+														{@const isDetached = v.attachments.every(a => a.state === 'detached')}
+														<p class="font-semibold mb-1.5" style="color: var(--color-muted);">{isDetached ? 'LAST ATTACHED TO' : 'ATTACHED TO'}</p>
 														{#each v.attachments as a}
+															{@const instName = instanceNameMap[a.instance_id]}
 															<div class="flex items-center gap-2 mb-1.5 flex-wrap">
-																<span class="font-mono">{a.instance_id}</span>
+																{#if instName}
+																	<span class="font-medium">{instName}</span>
+																	<span class="font-mono text-xs" style="color: var(--color-muted);">{a.instance_id}</span>
+																{:else}
+																	<span class="font-mono">{a.instance_id}</span>
+																{/if}
 																<span style="color: var(--color-muted);">on {a.device}</span>
-																<button
-																	onclick={(e) => { e.stopPropagation(); jumpToInstance(a.instance_id); }}
-																	class="text-xs rounded px-2 py-0.5 border transition-colors"
-																	style="border-color: var(--color-accent); color: var(--color-accent);"
-																>Jump to instance →</button>
+																{#if a.state === 'detached'}
+																	<span class="text-xs rounded px-1.5 py-0.5" style="background-color: var(--color-surface-raised); color: var(--color-muted);">detached</span>
+																{/if}
+																{#if instances.some(i => i.instance_id === a.instance_id)}
+																	<button
+																		onclick={(e) => { e.stopPropagation(); jumpToInstance(a.instance_id); }}
+																		class="text-xs rounded px-2 py-0.5 border transition-colors"
+																		style="border-color: var(--color-accent); color: var(--color-accent);"
+																	>Jump to instance →</button>
+																{/if}
 															</div>
 														{/each}
 													{:else}
 														<p class="font-semibold mb-1.5" style="color: var(--color-muted);">ATTACHED TO</p>
-														<p style="color: var(--color-muted);">Not attached</p>
+														<p style="color: var(--color-muted);">Not attached · no history available</p>
 													{/if}
 													{#if v.tags?.length}
 														<p class="font-semibold mb-1.5 mt-2" style="color: var(--color-muted);">TAGS</p>
